@@ -22,6 +22,7 @@ native-tls = ["reqwest/native-tls"]
 reqwest-blocking = ["reqwest/blocking"]
 rustls-tls = ["reqwest/rustls-tls"]
 timing-resistant-secret-traits = []
+jq-login = ["dep:jaq-core", "dep:jaq-std", "dep:jaq-json", "dep:anyhow"]
 
 [[example]]
 name = "github"
@@ -37,7 +38,7 @@ required-features = ["reqwest-blocking"]
 
 [[example]]
 name = "jq_login"
-required-features = ["reqwest-blocking"]
+required-features = ["reqwest-blocking", "jq-login"]
 
 [[example]]
 name = "letterboxd"
@@ -64,6 +65,15 @@ ureq = { version = "2", optional = true }
 url = { version = "2.1", features = ["serde"] }
 chrono = { version = "0.4.31", default-features = false, features = ["clock", "serde", "std", "wasmbind"] }
 serde_path_to_error = "0.1.2"
+anyhow = { version = "1.0", optional = true }
+jaq-core = { version = "3", optional = true }
+jaq-std = { version = "3", optional = true, default-features = false, features = [
+    "std",
+    "format",
+    "math",
+    "regex",
+] }
+jaq-json = { version = "2", features = ["serde"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
@@ -78,6 +88,3 @@ uuid = { version = "1.10", features = ["v4"] }
 anyhow = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 async-std = "1.13"
-jaq-core = "3"
-jaq-std = "3"
-jaq-json = { version = "2", features = ["serde"] }

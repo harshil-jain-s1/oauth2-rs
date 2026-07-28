@@ -496,6 +496,12 @@ pub mod helpers;
 
 mod introspection;
 
+/// A config-driven JSON-body login flow for providers that authenticate via
+/// a single non-standard JSON POST rather than a standard OAuth2 grant.
+/// Requires the "jq-login" feature.
+#[cfg(feature = "jq-login")]
+pub mod jq_login;
+
 /// HTTP client backed by the [reqwest](https://crates.io/crates/reqwest) crate.
 /// Requires "reqwest" feature.
 #[cfg(any(feature = "reqwest", feature = "reqwest-blocking"))]
