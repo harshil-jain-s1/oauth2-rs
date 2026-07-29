@@ -99,16 +99,7 @@ pub enum CredentialPlacement {
     /// `request_filter`, which decides how (or whether) they end up in the
     /// JSON request body.
     Body,
-    /// Send the id/secret as separate request headers with the given names.
-    /// Either header can be `None` to omit it. `request_filter` is still run
-    /// with `{"client_id": ..., "client_secret": ...}` as input, but is
-    /// expected not to place the credentials in the body in this mode.
-    Headers {
-        /// Header name carrying the client id, if any.
-        client_id_header: Option<String>,
-        /// Header name carrying the client secret, if any.
-        secret_header: Option<String>,
-    },
+
     /// Send the id/secret via HTTP Basic authentication, i.e. an
     /// `Authorization: Basic base64(client_id:secret)` header, per
     /// [RFC 7617](https://tools.ietf.org/html/rfc7617). `request_filter` is
@@ -194,7 +185,11 @@ impl JqLoginClient {
         self.parse_response(&response)
     }
 
-    fn prepare_login_request(&self) -> Result<HttpRequest, anyhow::Error> {
+    /// Builds the login [`HttpRequest`] without sending it, so callers can
+    /// inspect it (e.g. for debugging) or send it themselves via a
+    /// [`SyncHttpClient`]/[`AsyncHttpClient`] before passing the resulting
+    /// [`HttpResponse`] to [`Self::parse_response`].
+    pub fn prepare_login_request(&self) -> Result<HttpRequest, anyhow::Error> {
         let credentials_input = serde_json::json!({
             "client_id": self.client_id.as_str(),
             "client_secret": self.client_secret.secret(),
@@ -212,17 +207,6 @@ impl JqLoginClient {
 
         match &self.config.credentials {
             CredentialPlacement::Body => {}
-            CredentialPlacement::Headers {
-                client_id_header,
-                secret_header,
-            } => {
-                if let Some(header) = client_id_header {
-                    builder = builder.header(header, self.client_id.as_str());
-                }
-                if let Some(header) = secret_header {
-                    builder = builder.header(header, self.client_secret.secret());
-                }
-            }
             CredentialPlacement::BasicAuth => {
                 let credentials = format!(
                     "{}:{}",
@@ -239,7 +223,9 @@ impl JqLoginClient {
         Ok(builder.body(serde_json::to_vec(&body)?)?)
     }
 
-    fn parse_response(
+    /// Parses a login [`HttpResponse`] previously obtained via
+    /// [`Self::prepare_login_request`] into the token response.
+    pub fn parse_response(
         &self,
         response: &HttpResponse,
     ) -> Result<StandardTokenResponse<EmptyExtraTokenFields, BasicTokenType>, anyhow::Error> {
@@ -556,25 +542,6 @@ mod tests {
             token_response.refresh_token().unwrap().secret(),
             "0e42b0b8...."
         );
-    }
-
-    #[test]
-    fn sends_credentials_as_custom_headers() {
-        let mut config = base_config();
-        config.credentials = CredentialPlacement::Headers {
-            client_id_header: Some("X-Client-Id".to_string()),
-            secret_header: Some("X-Client-Secret".to_string()),
-        };
-        config.request_filter = "{}".to_string();
-        let client = client_with(config);
-
-        let request = client.prepare_login_request().unwrap();
-
-        assert_eq!(request.headers().get("X-Client-Id").unwrap(), "test");
-        assert_eq!(request.headers().get("X-Client-Secret").unwrap(), "secret");
-        // Credentials should not leak into the body in this mode.
-        let request_body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
-        assert_eq!(request_body, serde_json::json!({}));
     }
 
     #[test]

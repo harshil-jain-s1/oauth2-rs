@@ -55,6 +55,9 @@ fn main() -> Result<(), anyhow::Error> {
     let http_client = reqwest::blocking::ClientBuilder::new()
         // Following redirects opens the client up to SSRF vulnerabilities.
         .redirect(reqwest::redirect::Policy::none())
+        // Some providers (or the WAF/load balancer in front of them) reject
+        // requests with no User-Agent header as bot traffic.
+        .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
     let token_result = client.login(&http_client)?;
