@@ -101,9 +101,8 @@ use crate::{
 };
 
 /// Where/how the client id and secret are sent on the login request. Covers
-/// the three common ways a JQ login endpoint expects credentials.
-/// Deserializes from a plain string tag, e.g. `"body"`, `{"headers": {...}}`
-/// or `"basic_auth"`.
+/// the two common ways a JQ login endpoint expects credentials.
+/// Deserializes from a plain string tag, e.g. `"body"`, or `"basic_auth"`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialPlacement {
