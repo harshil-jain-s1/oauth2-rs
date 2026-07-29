@@ -50,14 +50,26 @@ fn main() -> Result<(), anyhow::Error> {
         Err(_) => default_config(),
     };
 
-    let client = JqLoginClient::new(login_url, client_id, client_secret, config);
+    let client = JqLoginClient::new(
+        login_url,
+        client_id,
+        client_secret,
+        config,
+        vec![],
+        std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::new(),
+    );
 
     let http_client = reqwest::blocking::ClientBuilder::new()
         // Following redirects opens the client up to SSRF vulnerabilities.
         .redirect(reqwest::redirect::Policy::none())
         // Some providers (or the WAF/load balancer in front of them) reject
         // requests with no User-Agent header as bot traffic.
-        .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .build()?;
 
     let token_result = client.login(&http_client)?;

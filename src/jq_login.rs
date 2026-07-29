@@ -31,29 +31,40 @@
 //! [`JqLoginConfig`]:
 //! - which JSON field (if any) carries the client id / secret in the request
 //! - a `jq` filter (`request_filter`) that turns `{"client_id": ...,
-//!   "client_secret": ...}` into the JSON body to send, e.g. renaming
-//!   fields, dropping one of them, or merging in extra static parameters
-//!   like a `grant_type` some providers still expect
+//!   "client_secret": ..., "scopes": [...]}` into the JSON body to send, e.g.
+//!   renaming fields, dropping one of them, or merging in extra static
+//!   parameters like a `grant_type` some providers still expect
 //! - a `jq` filter (`response_filter`) that turns the raw JSON response into
 //!   `{"access_token": ..., "refresh_token": ..., "expires_in": ...,
 //!   "token_type": ..., "scope": ...}`, so arbitrary provider-specific field
 //!   names, nesting, and type coercions (e.g. a numeric expiry sent as a
 //!   string) are handled in `jq` rather than as one-off Rust config knobs
 //!
-//! `request_filter`'s input is always exactly `{"client_id": ...,
-//! "client_secret": ...}` - nothing else is supplied automatically - so any
+//! `request_filter`'s input is always `{"client_id": ..., "client_secret":
+//! ...}`, plus a `"scopes"` field (a JSON array of strings) *only* when
+//! `scopes` is non-empty - nothing else is supplied automatically - so any
 //! other field a provider's login endpoint expects has to be added by the
 //! filter itself, as a literal merged into its output object. In practice
 //! that covers the full range of things such an endpoint might ask for:
 //! - `client_id` / `client_secret`: pulled straight from the filter input,
 //!   possibly under different field names, e.g. `{clientId: .client_id}`
+//! - `scope`: derived from `.scopes` when present, e.g. `{scope: (.scopes |
+//!   join(" "))}` - entirely up to the filter whether/how to include it; when
+//!   `scopes` is empty, `.scopes` is simply absent (`null`), so a filter
+//!   referencing it directly should guard with e.g. `if .scopes then {scope:
+//!   (.scopes | join(" "))} else {} end`
 //! - `grant_type`: a static literal, e.g.
 //!   `{grant_type: "client_credentials"}`
-//! - `scope`: a static, space-delimited string or JSON array literal, e.g.
-//!   `{scope: "read write"}` or `{scope: ["read", "write"]}`
 //! - any other provider-specific static parameter (`audience`, `resource`,
 //!   an API version/tenant id, ...): also just a literal, e.g.
 //!   `{audience: "https://api.example.com"}`
+//!
+//! `params` and `headers` passed to [`JqLoginClient::new`] are *not* part of
+//! `request_filter`'s input - instead, once the filter produces its output
+//! object, every `params` entry is merged into it, then every `headers`
+//! entry (so `headers` wins on key collisions), before the request is sent.
+//! This means they always end up in the request body regardless of whether
+//! `request_filter` references them at all.
 //!
 //! Only `client_id`/`client_secret` placement in headers or HTTP Basic auth
 //! (as opposed to the body) is controlled by [`CredentialPlacement`] instead
@@ -71,6 +82,7 @@
 //!
 //! Requires the `jq-login` feature.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use base64::prelude::*;
@@ -81,12 +93,12 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::basic::BasicTokenType;
+#[cfg(test)]
+use crate::TokenResponse;
 use crate::{
     AccessToken, AsyncHttpClient, ClientId, ClientSecret, EmptyExtraTokenFields, HttpRequest,
     HttpResponse, RefreshToken, Scope, StandardTokenResponse, SyncHttpClient,
 };
-#[cfg(test)]
-use crate::TokenResponse;
 
 /// Where/how the client id and secret are sent on the login request. Covers
 /// the three common ways a JQ login endpoint expects credentials.
@@ -138,23 +150,38 @@ pub struct JqLoginClient {
     client_id: ClientId,
     client_secret: ClientSecret,
     config: JqLoginConfig,
+    scopes: Vec<Scope>,
+    params: BTreeMap<String, String>,
+    headers: BTreeMap<String, String>,
 }
 
 impl JqLoginClient {
     /// Builds a client for the login endpoint at `login_url`, authenticating
     /// with `client_id`/`client_secret`, per `config`'s request/response
     /// shape.
+    ///
+    /// `scopes` is exposed to `request_filter` as `.scopes` (the filter
+    /// decides whether/how to include it). `params` and `headers` are not
+    /// visible to `request_filter` at all - they're merged directly into
+    /// whatever JSON object the filter produces, so they always end up in
+    /// the request body regardless of what the filter does.
     pub fn new(
         login_url: Url,
         client_id: ClientId,
         client_secret: ClientSecret,
         config: JqLoginConfig,
+        scopes: Vec<Scope>,
+        params: BTreeMap<String, String>,
+        headers: BTreeMap<String, String>,
     ) -> Self {
         Self {
             login_url,
             client_id,
             client_secret,
             config,
+            scopes,
+            params,
+            headers,
         }
     }
 
@@ -190,11 +217,18 @@ impl JqLoginClient {
     /// [`SyncHttpClient`]/[`AsyncHttpClient`] before passing the resulting
     /// [`HttpResponse`] to [`Self::parse_response`].
     pub fn prepare_login_request(&self) -> Result<HttpRequest, anyhow::Error> {
-        let credentials_input = serde_json::json!({
+        let mut credentials_input = serde_json::json!({
             "client_id": self.client_id.as_str(),
             "client_secret": self.client_secret.secret(),
         });
-        let body = run_jq(&self.config.request_filter, credentials_input)?;
+        if !self.scopes.is_empty() {
+            credentials_input["scopes"] = serde_json::Value::from(
+                self.scopes.iter().map(Scope::as_ref).collect::<Vec<_>>(),
+            );
+        }
+        let mut body = run_jq(&self.config.request_filter, credentials_input)?;
+        merge_string_map(&mut body, &self.params)?;
+        merge_string_map(&mut body, &self.headers)?;
         self.build_request(body)
     }
 
@@ -268,6 +302,28 @@ impl JqLoginClient {
 
         Ok(token_response)
     }
+}
+
+
+
+/// Merges `extra`'s entries directly into `body` (a JSON object), overwriting
+/// any existing keys of the same name. Used to fold `params`/`headers` into
+/// `request_filter`'s output regardless of whether the filter itself
+/// referenced them.
+fn merge_string_map(
+    body: &mut serde_json::Value,
+    extra: &BTreeMap<String, String>,
+) -> Result<(), anyhow::Error> {
+    if !body.is_object() {
+        return Err(anyhow::anyhow!(
+            "request_filter must produce a JSON object, got: {body}"
+        ));
+    }
+    let obj = body.as_object_mut().expect("checked above");
+    for (k, v) in extra {
+        obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    Ok(())
 }
 
 /// Compiles and runs a `jq` filter (via the pure-Rust `jaq` crate family)
@@ -357,11 +413,23 @@ mod tests {
     }
 
     fn client_with(config: JqLoginConfig) -> JqLoginClient {
+        client_with_context(config, vec![], BTreeMap::new(), BTreeMap::new())
+    }
+
+    fn client_with_context(
+        config: JqLoginConfig,
+        scopes: Vec<Scope>,
+        params: BTreeMap<String, String>,
+        headers: BTreeMap<String, String>,
+    ) -> JqLoginClient {
         JqLoginClient::new(
             Url::parse("https://example.com/login").unwrap(),
             ClientId::new("test".to_string()),
             ClientSecret::new("secret".to_string()),
             config,
+            scopes,
+            params,
+            headers,
         )
     }
 
@@ -561,6 +629,95 @@ mod tests {
         // Credentials should not leak into the body in this mode.
         let request_body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
         assert_eq!(request_body, serde_json::json!({}));
+    }
+
+    #[test]
+    fn params_are_merged_into_body_even_when_filter_ignores_them() {
+        let mut config = base_config();
+        config.request_filter = "{client_id: .client_id}".to_string();
+        let client = client_with_context(
+            config,
+            vec![],
+            BTreeMap::from([("audience".to_string(), "https://api.example.com".to_string())]),
+            BTreeMap::new(),
+        );
+
+        let request = client.prepare_login_request().unwrap();
+        let request_body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(request_body["client_id"], "test");
+        assert_eq!(request_body["audience"], "https://api.example.com");
+    }
+
+    #[test]
+    fn headers_are_merged_into_body_even_when_filter_ignores_them() {
+        let mut config = base_config();
+        config.request_filter = "{client_id: .client_id}".to_string();
+        let client = client_with_context(
+            config,
+            vec![],
+            BTreeMap::new(),
+            BTreeMap::from([("x-api-version".to_string(), "2".to_string())]),
+        );
+
+        let request = client.prepare_login_request().unwrap();
+        let request_body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(request_body["client_id"], "test");
+        assert_eq!(request_body["x-api-version"], "2");
+    }
+
+    #[test]
+    fn headers_win_over_params_on_key_collision() {
+        let mut config = base_config();
+        config.request_filter = "{}".to_string();
+        let client = client_with_context(
+            config,
+            vec![],
+            BTreeMap::from([("shared".to_string(), "from-params".to_string())]),
+            BTreeMap::from([("shared".to_string(), "from-headers".to_string())]),
+        );
+
+        let request = client.prepare_login_request().unwrap();
+        let request_body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(request_body["shared"], "from-headers");
+    }
+
+    #[test]
+    fn scopes_are_visible_to_request_filter() {
+        let mut config = base_config();
+        config.request_filter = "{scope: (.scopes | join(\" \"))}".to_string();
+        let client = client_with_context(
+            config,
+            vec![Scope::new("read".to_string()), Scope::new("write".to_string())],
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+
+        let request = client.prepare_login_request().unwrap();
+        let request_body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(request_body["scope"], "read write");
+    }
+
+    #[test]
+    fn filter_can_omit_scope_field_when_scopes_is_empty() {
+        let mut config = base_config();
+        config.request_filter =
+            "if .scopes then {scope: (.scopes | join(\" \"))} else {} end".to_string();
+        let client = client_with_context(config, vec![], BTreeMap::new(), BTreeMap::new());
+
+        let request = client.prepare_login_request().unwrap();
+        let request_body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert!(request_body.get("scope").is_none());
+    }
+
+    #[test]
+    fn scopes_key_is_absent_from_filter_input_when_scopes_is_empty() {
+        let mut config = base_config();
+        config.request_filter = "{has_scopes: (.scopes != null)}".to_string();
+        let client = client_with_context(config, vec![], BTreeMap::new(), BTreeMap::new());
+
+        let request = client.prepare_login_request().unwrap();
+        let request_body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(request_body["has_scopes"], false);
     }
 
     #[test]
