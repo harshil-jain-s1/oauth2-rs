@@ -496,11 +496,11 @@ pub mod helpers;
 
 mod introspection;
 
-/// A config-driven JSON-body login flow for providers that authenticate via
-/// a single non-standard JSON POST rather than a standard OAuth2 grant.
-/// Requires the "jq-login" feature.
-#[cfg(feature = "jq-login")]
-pub mod jq_login;
+/// Support for non-standard OAuth2-like providers via jq-style JSON
+/// transforms threaded through the standard `Client`/token-request
+/// machinery. Requires the "nonstd-compat" feature to actually apply any
+/// transform.
+mod nonstd;
 
 /// HTTP client backed by the [reqwest](https://crates.io/crates/reqwest) crate.
 /// Requires "reqwest" feature.
@@ -539,6 +539,7 @@ pub use crate::error::{
 pub use crate::introspection::{
     IntrospectionRequest, StandardTokenIntrospectionResponse, TokenIntrospectionResponse,
 };
+pub use crate::nonstd::NonStdCompat;
 pub use crate::revocation::{
     RevocableToken, RevocationErrorResponseType, RevocationRequest, StandardRevocableToken,
 };

@@ -1,9 +1,9 @@
 use crate::endpoint::{endpoint_request, endpoint_response};
 use crate::{
     AccessToken, AsyncHttpClient, AuthType, AuthorizationCode, Client, ClientId, ClientSecret,
-    EndpointState, ErrorResponse, HttpRequest, PkceCodeVerifier, RedirectUrl, RefreshToken,
-    RequestTokenError, ResourceOwnerPassword, ResourceOwnerUsername, RevocableToken, Scope,
-    SyncHttpClient, TokenIntrospectionResponse, TokenUrl,
+    EndpointState, ErrorResponse, HttpRequest, NonStdCompat, PkceCodeVerifier, RedirectUrl,
+    RefreshToken, RequestTokenError, ResourceOwnerPassword, ResourceOwnerUsername, RevocableToken,
+    Scope, SyncHttpClient, TokenIntrospectionResponse, TokenUrl,
 };
 
 use serde::de::DeserializeOwned;
@@ -66,6 +66,7 @@ where
             extra_params: Vec::new(),
             scopes: Vec::new(),
             token_url,
+            nonstd_compat: self.nonstd_compat.as_ref(),
             _phantom: PhantomData,
         }
     }
@@ -84,6 +85,7 @@ where
             pkce_verifier: None,
             token_url,
             redirect_url: self.redirect_url.as_ref().map(Cow::Borrowed),
+            nonstd_compat: self.nonstd_compat.as_ref(),
             _phantom: PhantomData,
         }
     }
@@ -103,6 +105,7 @@ where
             extra_params: Vec::new(),
             scopes: Vec::new(),
             token_url,
+            nonstd_compat: self.nonstd_compat.as_ref(),
             _phantom: PhantomData,
         }
     }
@@ -120,6 +123,7 @@ where
             refresh_token,
             scopes: Vec::new(),
             token_url,
+            nonstd_compat: self.nonstd_compat.as_ref(),
             _phantom: PhantomData,
         }
     }
@@ -142,6 +146,7 @@ where
     pub(crate) pkce_verifier: Option<PkceCodeVerifier>,
     pub(crate) token_url: &'a TokenUrl,
     pub(crate) redirect_url: Option<Cow<'a, RedirectUrl>>,
+    pub(crate) nonstd_compat: Option<&'a NonStdCompat>,
     pub(crate) _phantom: PhantomData<(TE, TR)>,
 }
 impl<'a, TE, TR> CodeTokenRequest<'a, TE, TR>
@@ -208,6 +213,7 @@ where
             None,
             self.token_url.url(),
             params,
+            self.nonstd_compat,
         )
         .map_err(|err| RequestTokenError::Other(format!("failed to prepare request: {err}")))
     }
@@ -220,7 +226,8 @@ where
     where
         C: SyncHttpClient,
     {
-        endpoint_response(http_client.call(self.prepare_request()?)?)
+        let nonstd_compat = self.nonstd_compat;
+        endpoint_response(http_client.call(self.prepare_request()?)?, nonstd_compat)
     }
 
     /// Asynchronously sends the request to the authorization server and returns a Future.
@@ -232,7 +239,13 @@ where
         Self: 'c,
         C: AsyncHttpClient<'c>,
     {
-        Box::pin(async move { endpoint_response(http_client.call(self.prepare_request()?).await?) })
+        Box::pin(async move {
+            let nonstd_compat = self.nonstd_compat;
+            endpoint_response(
+                http_client.call(self.prepare_request()?).await?,
+                nonstd_compat,
+            )
+        })
     }
 }
 
@@ -252,6 +265,7 @@ where
     pub(crate) refresh_token: &'a RefreshToken,
     pub(crate) scopes: Vec<Cow<'a, Scope>>,
     pub(crate) token_url: &'a TokenUrl,
+    pub(crate) nonstd_compat: Option<&'a NonStdCompat>,
     pub(crate) _phantom: PhantomData<(TE, TR)>,
 }
 impl<'a, TE, TR> RefreshTokenRequest<'a, TE, TR>
@@ -304,7 +318,7 @@ where
     where
         C: SyncHttpClient,
     {
-        endpoint_response(http_client.call(self.prepare_request()?)?)
+        endpoint_response(http_client.call(self.prepare_request()?)?, self.nonstd_compat)
     }
     /// Asynchronously sends the request to the authorization server and awaits a response.
     pub fn request_async<'c, C>(
@@ -315,7 +329,12 @@ where
         Self: 'c,
         C: AsyncHttpClient<'c>,
     {
-        Box::pin(async move { endpoint_response(http_client.call(self.prepare_request()?).await?) })
+        Box::pin(async move {
+            endpoint_response(
+                http_client.call(self.prepare_request()?).await?,
+                self.nonstd_compat,
+            )
+        })
     }
 
     fn prepare_request<RE>(&self) -> Result<HttpRequest, RequestTokenError<RE, TE>>
@@ -334,6 +353,7 @@ where
                 ("grant_type", "refresh_token"),
                 ("refresh_token", self.refresh_token.secret()),
             ],
+            self.nonstd_compat,
         )
         .map_err(|err| RequestTokenError::Other(format!("failed to prepare request: {err}")))
     }
@@ -356,6 +376,7 @@ where
     pub(crate) password: &'a ResourceOwnerPassword,
     pub(crate) scopes: Vec<Cow<'a, Scope>>,
     pub(crate) token_url: &'a TokenUrl,
+    pub(crate) nonstd_compat: Option<&'a NonStdCompat>,
     pub(crate) _phantom: PhantomData<(TE, TR)>,
 }
 impl<'a, TE, TR> PasswordTokenRequest<'a, TE, TR>
@@ -408,7 +429,7 @@ where
     where
         C: SyncHttpClient,
     {
-        endpoint_response(http_client.call(self.prepare_request()?)?)
+        endpoint_response(http_client.call(self.prepare_request()?)?, self.nonstd_compat)
     }
 
     /// Asynchronously sends the request to the authorization server and awaits a response.
@@ -420,7 +441,12 @@ where
         Self: 'c,
         C: AsyncHttpClient<'c>,
     {
-        Box::pin(async move { endpoint_response(http_client.call(self.prepare_request()?).await?) })
+        Box::pin(async move {
+            endpoint_response(
+                http_client.call(self.prepare_request()?).await?,
+                self.nonstd_compat,
+            )
+        })
     }
 
     fn prepare_request<RE>(&self) -> Result<HttpRequest, RequestTokenError<RE, TE>>
@@ -440,6 +466,7 @@ where
                 ("username", self.username),
                 ("password", self.password.secret()),
             ],
+            self.nonstd_compat,
         )
         .map_err(|err| RequestTokenError::Other(format!("failed to prepare request: {err}")))
     }
@@ -460,6 +487,7 @@ where
     pub(crate) extra_params: Vec<(Cow<'a, str>, Cow<'a, str>)>,
     pub(crate) scopes: Vec<Cow<'a, Scope>>,
     pub(crate) token_url: &'a TokenUrl,
+    pub(crate) nonstd_compat: Option<&'a NonStdCompat>,
     pub(crate) _phantom: PhantomData<(TE, TR)>,
 }
 impl<'a, TE, TR> ClientCredentialsTokenRequest<'a, TE, TR>
@@ -512,7 +540,7 @@ where
     where
         C: SyncHttpClient,
     {
-        endpoint_response(http_client.call(self.prepare_request()?)?)
+        endpoint_response(http_client.call(self.prepare_request()?)?, self.nonstd_compat)
     }
 
     /// Asynchronously sends the request to the authorization server and awaits a response.
@@ -524,7 +552,12 @@ where
         Self: 'c,
         C: AsyncHttpClient<'c>,
     {
-        Box::pin(async move { endpoint_response(http_client.call(self.prepare_request()?).await?) })
+        Box::pin(async move {
+            endpoint_response(
+                http_client.call(self.prepare_request()?).await?,
+                self.nonstd_compat,
+            )
+        })
     }
 
     fn prepare_request<RE>(&self) -> Result<HttpRequest, RequestTokenError<RE, TE>>
@@ -540,6 +573,7 @@ where
             Some(&self.scopes),
             self.token_url.url(),
             vec![("grant_type", "client_credentials")],
+            self.nonstd_compat,
         )
         .map_err(|err| RequestTokenError::Other(format!("failed to prepare request: {err}")))
     }

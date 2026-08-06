@@ -22,7 +22,7 @@ native-tls = ["reqwest/native-tls"]
 reqwest-blocking = ["reqwest/blocking"]
 rustls-tls = ["reqwest/rustls-tls"]
 timing-resistant-secret-traits = []
-jq-login = ["dep:jaq-core", "dep:jaq-std", "dep:jaq-json", "dep:anyhow"]
+nonstd-compat = ["dep:jaq-core", "dep:jaq-std", "dep:jaq-json"]
 
 [[example]]
 name = "github"
@@ -37,8 +37,8 @@ name = "google_devicecode"
 required-features = ["reqwest-blocking"]
 
 [[example]]
-name = "jq_login"
-required-features = ["reqwest-blocking", "jq-login"]
+name = "nonstd_compat"
+required-features = ["reqwest-blocking", "nonstd-compat"]
 
 [[example]]
 name = "letterboxd"
@@ -65,7 +65,6 @@ ureq = { version = "2", optional = true }
 url = { version = "2.1", features = ["serde"] }
 chrono = { version = "0.4.31", default-features = false, features = ["clock", "serde", "std", "wasmbind"] }
 serde_path_to_error = "0.1.2"
-anyhow = { version = "1.0", optional = true }
 jaq-core = { version = "3", optional = true }
 jaq-std = { version = "3", optional = true, default-features = false, features = [
     "std",

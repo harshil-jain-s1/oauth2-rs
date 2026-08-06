@@ -3,9 +3,9 @@ use crate::{
     ClientCredentialsTokenRequest, ClientId, ClientSecret, CodeTokenRequest, ConfigurationError,
     CsrfToken, DeviceAccessTokenRequest, DeviceAuthorizationRequest, DeviceAuthorizationResponse,
     DeviceAuthorizationUrl, ErrorResponse, ExtraDeviceAuthorizationFields, IntrospectionRequest,
-    IntrospectionUrl, PasswordTokenRequest, RedirectUrl, RefreshToken, RefreshTokenRequest,
-    ResourceOwnerPassword, ResourceOwnerUsername, RevocableToken, RevocationRequest, RevocationUrl,
-    TokenIntrospectionResponse, TokenResponse, TokenUrl,
+    IntrospectionUrl, NonStdCompat, PasswordTokenRequest, RedirectUrl, RefreshToken,
+    RefreshTokenRequest, ResourceOwnerPassword, ResourceOwnerUsername, RevocableToken,
+    RevocationRequest, RevocationUrl, TokenIntrospectionResponse, TokenResponse, TokenUrl,
 };
 
 use std::marker::PhantomData;
@@ -152,6 +152,7 @@ pub struct Client<
     pub(crate) introspection_url: Option<IntrospectionUrl>,
     pub(crate) revocation_url: Option<RevocationUrl>,
     pub(crate) device_authorization_url: Option<DeviceAuthorizationUrl>,
+    pub(crate) nonstd_compat: Option<NonStdCompat>,
     #[allow(clippy::type_complexity)]
     pub(crate) phantom: PhantomData<(
         TE,
@@ -198,6 +199,7 @@ where
             introspection_url: None,
             revocation_url: None,
             device_authorization_url: None,
+            nonstd_compat: None,
             phantom: PhantomData,
         }
     }
@@ -283,6 +285,7 @@ where
             introspection_url: self.introspection_url,
             revocation_url: self.revocation_url,
             device_authorization_url: self.device_authorization_url,
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }
@@ -318,6 +321,7 @@ where
             introspection_url: self.introspection_url,
             revocation_url: self.revocation_url,
             device_authorization_url: self.device_authorization_url,
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }
@@ -329,6 +333,29 @@ where
     /// [RFC 8252](https://tools.ietf.org/html/rfc8252)).
     pub fn set_client_secret(mut self, client_secret: ClientSecret) -> Self {
         self.client_secret = Some(client_secret);
+
+        self
+    }
+
+    /// Set the [`NonStdCompat`] configuration used to talk to
+    /// non-standards-compliant token endpoints (jq-based request/response
+    /// transforms and an overridden expected response `Content-Type`).
+    ///
+    /// Requires the "nonstd-compat" feature.
+    #[cfg(feature = "nonstd-compat")]
+    pub fn set_nonstd_compat(mut self, nonstd_compat: NonStdCompat) -> Self {
+        self.nonstd_compat = Some(nonstd_compat);
+
+        self
+    }
+
+    /// Conditionally set the [`NonStdCompat`] configuration used to talk to
+    /// non-standards-compliant token endpoints.
+    ///
+    /// Requires the "nonstd-compat" feature.
+    #[cfg(feature = "nonstd-compat")]
+    pub fn set_nonstd_compat_option(mut self, nonstd_compat: Option<NonStdCompat>) -> Self {
+        self.nonstd_compat = nonstd_compat;
 
         self
     }
@@ -362,6 +389,7 @@ where
             introspection_url: self.introspection_url,
             revocation_url: self.revocation_url,
             device_authorization_url: Some(device_authorization_url),
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }
@@ -395,6 +423,7 @@ where
             introspection_url: self.introspection_url,
             revocation_url: self.revocation_url,
             device_authorization_url,
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }
@@ -427,6 +456,7 @@ where
             introspection_url: Some(introspection_url),
             revocation_url: self.revocation_url,
             device_authorization_url: self.device_authorization_url,
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }
@@ -460,6 +490,7 @@ where
             introspection_url,
             revocation_url: self.revocation_url,
             device_authorization_url: self.device_authorization_url,
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }
@@ -499,6 +530,7 @@ where
             introspection_url: self.introspection_url,
             revocation_url: Some(revocation_url),
             device_authorization_url: self.device_authorization_url,
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }
@@ -532,6 +564,7 @@ where
             introspection_url: self.introspection_url,
             revocation_url,
             device_authorization_url: self.device_authorization_url,
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }
@@ -567,6 +600,7 @@ where
             introspection_url: self.introspection_url,
             revocation_url: self.revocation_url,
             device_authorization_url: self.device_authorization_url,
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }
@@ -602,6 +636,7 @@ where
             introspection_url: self.introspection_url,
             revocation_url: self.revocation_url,
             device_authorization_url: self.device_authorization_url,
+            nonstd_compat: self.nonstd_compat,
             phantom: PhantomData,
         }
     }

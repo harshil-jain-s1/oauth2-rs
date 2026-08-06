@@ -4,8 +4,8 @@ use crate::types::VerificationUriComplete;
 use crate::{
     AsyncHttpClient, AuthType, Client, ClientId, ClientSecret, DeviceAuthorizationUrl, DeviceCode,
     EndUserVerificationUrl, EndpointState, ErrorResponse, ErrorResponseType, HttpRequest,
-    HttpResponse, RequestTokenError, RevocableToken, Scope, StandardErrorResponse, SyncHttpClient,
-    TokenIntrospectionResponse, TokenResponse, TokenUrl, UserCode,
+    HttpResponse, NonStdCompat, RequestTokenError, RevocableToken, Scope, StandardErrorResponse,
+    SyncHttpClient, TokenIntrospectionResponse, TokenResponse, TokenUrl, UserCode,
 };
 
 use chrono::{DateTime, Utc};
@@ -68,6 +68,7 @@ where
             extra_params: Vec::new(),
             scopes: Vec::new(),
             device_authorization_url,
+            nonstd_compat: self.nonstd_compat.as_ref(),
             _phantom: PhantomData,
         }
     }
@@ -89,6 +90,7 @@ where
             dev_auth_resp: auth_response,
             time_fn: Arc::new(Utc::now),
             max_backoff_interval: None,
+            nonstd_compat: self.nonstd_compat.as_ref(),
             _phantom: PhantomData,
         }
     }
@@ -108,6 +110,7 @@ where
     pub(crate) extra_params: Vec<(Cow<'a, str>, Cow<'a, str>)>,
     pub(crate) scopes: Vec<Cow<'a, Scope>>,
     pub(crate) device_authorization_url: &'a DeviceAuthorizationUrl,
+    pub(crate) nonstd_compat: Option<&'a NonStdCompat>,
     pub(crate) _phantom: PhantomData<TE>,
 }
 
@@ -165,6 +168,7 @@ where
             Some(&self.scopes),
             self.device_authorization_url.url(),
             vec![],
+            self.nonstd_compat,
         )
         .map_err(|err| RequestTokenError::Other(format!("failed to prepare request: {err}")))
     }
@@ -178,7 +182,8 @@ where
         C: SyncHttpClient,
         EF: ExtraDeviceAuthorizationFields,
     {
-        endpoint_response(http_client.call(self.prepare_request()?)?)
+        let nonstd_compat = self.nonstd_compat;
+        endpoint_response(http_client.call(self.prepare_request()?)?, nonstd_compat)
     }
 
     /// Asynchronously sends the request to the authorization server and returns a Future.
@@ -196,7 +201,13 @@ where
         C: AsyncHttpClient<'c>,
         EF: ExtraDeviceAuthorizationFields,
     {
-        Box::pin(async move { endpoint_response(http_client.call(self.prepare_request()?).await?) })
+        Box::pin(async move {
+            let nonstd_compat = self.nonstd_compat;
+            endpoint_response(
+                http_client.call(self.prepare_request()?).await?,
+                nonstd_compat,
+            )
+        })
     }
 }
 
@@ -217,6 +228,7 @@ where
     pub(crate) dev_auth_resp: &'a DeviceAuthorizationResponse<EF>,
     pub(crate) time_fn: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync + 'b>,
     pub(crate) max_backoff_interval: Option<Duration>,
+    pub(crate) nonstd_compat: Option<&'a NonStdCompat>,
     pub(crate) _phantom: PhantomData<(TR, EF)>,
 }
 
@@ -263,6 +275,7 @@ where
             dev_auth_resp: self.dev_auth_resp,
             time_fn: Arc::new(time_fn),
             max_backoff_interval: self.max_backoff_interval,
+            nonstd_compat: self.nonstd_compat,
             _phantom: PhantomData,
         }
     }
@@ -383,6 +396,7 @@ where
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", self.dev_auth_resp.device_code().secret()),
             ],
+            self.nonstd_compat,
         )
         .map_err(|err| RequestTokenError::Other(format!("failed to prepare request: {err}")))
     }
@@ -413,7 +427,8 @@ where
         };
 
         // Explicitly process the response with a DeviceCodeErrorResponse
-        let res = endpoint_response::<RE, DeviceCodeErrorResponse, TR>(http_response);
+        let res =
+            endpoint_response::<RE, DeviceCodeErrorResponse, TR>(http_response, self.nonstd_compat);
         match res {
             // On a ServerResponse error, the error needs inspecting as a DeviceCodeErrorResponse
             // to work out whether a retry needs to happen.

@@ -1,6 +1,6 @@
 use crate::{
-    AuthType, ClientId, ClientSecret, ErrorResponse, RedirectUrl, RequestTokenError, Scope,
-    CONTENT_TYPE_FORMENCODED, CONTENT_TYPE_JSON,
+    AuthType, ClientId, ClientSecret, ErrorResponse, NonStdCompat, RedirectUrl,
+    RequestTokenError, Scope, CONTENT_TYPE_FORMENCODED, CONTENT_TYPE_JSON,
 };
 
 use base64::prelude::*;
@@ -78,14 +78,18 @@ pub(crate) fn endpoint_request<'a>(
     scopes: Option<&'a Vec<Cow<'a, Scope>>>,
     url: &'a Url,
     params: Vec<(&'a str, &'a str)>,
-) -> Result<HttpRequest, http::Error> {
+    nonstd_compat: Option<&'a NonStdCompat>,
+) -> Result<HttpRequest, String> {
+    let accept_content_type = nonstd_compat
+        .and_then(|c| c.res_type.as_deref())
+        .unwrap_or(CONTENT_TYPE_JSON);
+
     let mut builder = http::Request::builder()
         .uri(url.to_string())
         .method(http::Method::POST)
-        .header(ACCEPT, HeaderValue::from_static(CONTENT_TYPE_JSON))
         .header(
-            CONTENT_TYPE,
-            HeaderValue::from_static(CONTENT_TYPE_FORMENCODED),
+            ACCEPT,
+            HeaderValue::from_str(accept_content_type).map_err(|e| e.to_string())?,
         );
 
     let scopes_opt = scopes.and_then(|scopes| {
@@ -146,16 +150,43 @@ pub(crate) fn endpoint_request<'a>(
             .as_slice(),
     );
 
+    let req_map = nonstd_compat.and_then(|c| c.req_map.as_deref());
+
+    #[cfg(feature = "nonstd-compat")]
+    if let Some(filter) = req_map {
+        let json_params = serde_json::Value::Object(
+            params
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                .collect(),
+        );
+        let mapped = crate::nonstd::run_jq(filter, json_params)?;
+        let body = serde_json::to_vec(&mapped).map_err(|e| e.to_string())?;
+        return builder
+            .header(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON))
+            .body(body)
+            .map_err(|e| e.to_string());
+    }
+    #[cfg(not(feature = "nonstd-compat"))]
+    let _ = req_map;
+
     let body = form_urlencoded::Serializer::new(String::new())
         .extend_pairs(params)
         .finish()
         .into_bytes();
 
-    builder.body(body)
+    builder
+        .header(
+            CONTENT_TYPE,
+            HeaderValue::from_static(CONTENT_TYPE_FORMENCODED),
+        )
+        .body(body)
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn endpoint_response<RE, TE, DO>(
     http_response: HttpResponse,
+    nonstd_compat: Option<&NonStdCompat>,
 ) -> Result<DO, RequestTokenError<RE, TE>>
 where
     RE: Error,
@@ -164,9 +195,31 @@ where
 {
     check_response_status(&http_response)?;
 
-    check_response_body(&http_response)?;
+    let expected_content_type = nonstd_compat
+        .and_then(|c| c.res_type.as_deref())
+        .unwrap_or(CONTENT_TYPE_JSON);
+    check_response_body(&http_response, expected_content_type)?;
 
     let response_body = http_response.body().as_slice();
+
+    #[cfg(feature = "nonstd-compat")]
+    let mapped_body: Option<Vec<u8>> = match nonstd_compat.and_then(|c| c.res_map.as_deref()) {
+        Some(filter) => {
+            let value: serde_json::Value = serde_json::from_slice(response_body).map_err(|e| {
+                RequestTokenError::Other(format!("res_map: response body is not JSON: {e}"))
+            })?;
+            let mapped = crate::nonstd::run_jq(filter, value).map_err(RequestTokenError::Other)?;
+            Some(serde_json::to_vec(&mapped).map_err(|e| {
+                RequestTokenError::Other(format!("res_map: failed to re-serialize: {e}"))
+            })?)
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "nonstd-compat"))]
+    let mapped_body: Option<Vec<u8>> = None;
+
+    let response_body = mapped_body.as_deref().unwrap_or(response_body);
+
     serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_slice(response_body))
         .map_err(|e| RequestTokenError::Parse(e, response_body.to_vec()))
 }
@@ -210,12 +263,13 @@ where
 
 fn check_response_body<RE, TE>(
     http_response: &HttpResponse,
+    expected_content_type: &str,
 ) -> Result<(), RequestTokenError<RE, TE>>
 where
     RE: Error + 'static,
     TE: ErrorResponse,
 {
-    // Validate that the response Content-Type is JSON.
+    // Validate that the response Content-Type matches what's expected.
     http_response
     .headers()
     .get(CONTENT_TYPE)
@@ -223,11 +277,11 @@ where
       // Section 3.1.1.1 of RFC 7231 indicates that media types are case-insensitive and
       // may be followed by optional whitespace and/or a parameter (e.g., charset).
       // See https://tools.ietf.org/html/rfc7231#section-3.1.1.1.
-      if content_type.to_str().ok().filter(|ct| ct.to_lowercase().starts_with(CONTENT_TYPE_JSON)).is_none() {
+      if content_type.to_str().ok().filter(|ct| ct.to_lowercase().starts_with(&expected_content_type.to_lowercase())).is_none() {
         Err(
           RequestTokenError::Other(
             format!(
-              "unexpected response Content-Type: {content_type:?}, should be `{CONTENT_TYPE_JSON}`",
+              "unexpected response Content-Type: {content_type:?}, should be `{expected_content_type}`",
             )
           )
         )
@@ -273,5 +327,126 @@ mod tests {
             .unwrap();
 
         assert_eq!("12/34", token.access_token().secret());
+    }
+
+    #[cfg(feature = "nonstd-compat")]
+    mod nonstd_compat {
+        use crate::tests::{new_client, FakeError};
+        use crate::{AuthType, NonStdCompat, RequestTokenError, TokenResponse};
+
+        use http::header::CONTENT_TYPE;
+        use http::{HeaderValue, Response, StatusCode};
+
+        #[test]
+        fn req_map_produces_a_json_body() {
+            let client = new_client()
+                .set_auth_type(AuthType::RequestBody)
+                .set_nonstd_compat(NonStdCompat::new().with_req_map("del(.grant_type)"));
+
+            let http_response = Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/json").unwrap(),
+                )
+                .body(
+                    "{\"access_token\": \"12/34\", \"token_type\": \"bearer\"}"
+                        .to_string()
+                        .into_bytes(),
+                )
+                .unwrap();
+
+            let token = client
+                .exchange_client_credentials()
+                .request(&move |request: crate::HttpRequest| {
+                    assert_eq!(
+                        request.headers().get(CONTENT_TYPE).unwrap(),
+                        "application/json"
+                    );
+                    let body: serde_json::Value =
+                        serde_json::from_slice(request.body()).unwrap();
+                    assert_eq!(
+                        body,
+                        serde_json::json!({"client_id": "aaa", "client_secret": "bbb"})
+                    );
+                    Ok(http_response.clone()) as Result<_, FakeError>
+                })
+                .unwrap();
+
+            assert_eq!("12/34", token.access_token().secret());
+        }
+
+        #[test]
+        fn res_map_transforms_response_before_deserializing() {
+            let client = new_client().set_nonstd_compat(
+                NonStdCompat::new()
+                    .with_res_map("{access_token: .jwt, token_type: \"bearer\"}"),
+            );
+
+            let http_response = Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/json").unwrap(),
+                )
+                .body("{\"jwt\": \"12/34\"}".to_string().into_bytes())
+                .unwrap();
+
+            let token = client
+                .exchange_client_credentials()
+                .request(&move |_| Ok(http_response.clone()) as Result<_, FakeError>)
+                .unwrap();
+
+            assert_eq!("12/34", token.access_token().secret());
+        }
+
+        #[test]
+        fn res_type_allows_a_non_json_content_type() {
+            let client = new_client().set_nonstd_compat(
+                NonStdCompat::new().with_res_type("application/vnd.provider+json"),
+            );
+
+            let http_response = Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/vnd.provider+json").unwrap(),
+                )
+                .body(
+                    "{\"access_token\": \"12/34\", \"token_type\": \"bearer\"}"
+                        .to_string()
+                        .into_bytes(),
+                )
+                .unwrap();
+
+            let token = client
+                .exchange_client_credentials()
+                .request(&move |request: crate::HttpRequest| {
+                    assert_eq!(
+                        request.headers().get(http::header::ACCEPT).unwrap(),
+                        "application/vnd.provider+json"
+                    );
+                    Ok(http_response.clone()) as Result<_, FakeError>
+                })
+                .unwrap();
+
+            assert_eq!("12/34", token.access_token().secret());
+        }
+
+        #[test]
+        fn jq_error_surfaces_as_other() {
+            let client = new_client().set_nonstd_compat(
+                NonStdCompat::new().with_req_map("this is not jq"),
+            );
+
+            let err = client
+                .exchange_client_credentials()
+                .request(&move |_: crate::HttpRequest| -> Result<_, FakeError> {
+                    unreachable!("request should not be sent when req_map fails to compile")
+                })
+                .unwrap_err();
+
+            assert!(matches!(err, RequestTokenError::Other(_)));
+        }
     }
 }
