@@ -3,50 +3,56 @@
 //! machinery, rather than a bespoke parallel client. See
 //! [`NonStdCompat`] and [`crate::Client::set_nonstd_compat`].
 
+use std::fmt;
+use std::sync::Arc;
+
 /// Bundles the three knobs needed to talk to a non-standards-compliant
 /// token endpoint:
 /// - `req_map`: a jq filter applied to the outgoing request body (as a flat
 ///   JSON object of the same fields this crate would otherwise
-///   form-encode) before it is sent. When set, the request is sent as a
-///   JSON body (`Content-Type: application/json`) instead of
-///   form-urlencoded.
+///   form-encode) before it is sent. The filter's output controls both the
+///   request body and its `Content-Type` — see [`CompiledFilter`]'s module
+///   docs for the exact contract.
 /// - `res_map`: a jq filter applied to the raw JSON response body before
 ///   this crate's standard deserialization runs.
 /// - `res_type`: overrides the expected response `Content-Type` (and the
 ///   outgoing `Accept` header), replacing this crate's built-in
 ///   `application/json` assumption.
 ///
-/// Attach via [`Client::set_nonstd_compat`](crate::Client::set_nonstd_compat).
-/// Actually applying `req_map`/`res_map` (via the pure-Rust `jaq` jq
-/// engine) requires the `nonstd-compat` feature; the setters that populate
-/// this struct's fields are gated on that feature.
+/// `req_map`/`res_map` are compiled once, in [`NonStdCompat::build`], rather
+/// than on every request/response - call `.build()` after the `with_*`
+/// calls and before [`Client::set_nonstd_compat`](crate::Client::set_nonstd_compat).
+/// Actually applying `req_map`/`res_map` (via the pure-Rust `jaq` jq engine)
+/// requires the `nonstd-compat` feature; the setters that populate this
+/// struct's fields are gated on that feature.
 #[derive(Clone, Debug, Default)]
 pub struct NonStdCompat {
-    pub(crate) req_map: Option<String>,
-    pub(crate) res_map: Option<String>,
+    req_map_src: Option<String>,
+    res_map_src: Option<String>,
+    pub(crate) req_map: Option<Arc<CompiledFilter>>,
+    pub(crate) res_map: Option<Arc<CompiledFilter>>,
     pub(crate) res_type: Option<String>,
 }
 
 impl NonStdCompat {
     /// Creates an empty configuration; use the `with_*` methods to set
-    /// individual fields.
+    /// individual fields, then [`Self::build`] to compile the filters.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Sets the jq filter applied to the outgoing request body (a flat JSON
-    /// object of the same fields this crate would otherwise form-encode,
-    /// e.g. `grant_type`, `client_id`, `client_secret`, `scope`) before it
-    /// is sent. Switches the request body to JSON.
+    /// Sets the jq filter applied to the outgoing request body before it is
+    /// sent; see [`CompiledFilter`]'s module docs for the exact contract.
+    /// Compiled by [`Self::build`].
     pub fn with_req_map(mut self, req_map: impl Into<String>) -> Self {
-        self.req_map = Some(req_map.into());
+        self.req_map_src = Some(req_map.into());
         self
     }
 
     /// Sets the jq filter applied to the raw JSON response body before this
-    /// crate's standard deserialization runs.
+    /// crate's standard deserialization runs. Compiled by [`Self::build`].
     pub fn with_res_map(mut self, res_map: impl Into<String>) -> Self {
-        self.res_map = Some(res_map.into());
+        self.res_map_src = Some(res_map.into());
         self
     }
 
@@ -55,6 +61,25 @@ impl NonStdCompat {
     pub fn with_res_type(mut self, res_type: impl Into<String>) -> Self {
         self.res_type = Some(res_type.into());
         self
+    }
+
+    /// Compiles any `req_map`/`res_map` jq filter source set via `with_*`
+    /// into a [`CompiledFilter`], so it's parsed and compiled exactly once
+    /// rather than on every request/response. Returns the first compile
+    /// error encountered, if any.
+    ///
+    /// Requires the "nonstd-compat" feature. Must be called before
+    /// [`Client::set_nonstd_compat`](crate::Client::set_nonstd_compat) for
+    /// `req_map`/`res_map` to actually take effect.
+    #[cfg(feature = "nonstd-compat")]
+    pub fn build(mut self) -> Result<Self, String> {
+        if let Some(src) = self.req_map_src.take() {
+            self.req_map = Some(Arc::new(CompiledFilter::new(&src)?));
+        }
+        if let Some(src) = self.res_map_src.take() {
+            self.res_map = Some(Arc::new(CompiledFilter::new(&src)?));
+        }
+        Ok(self)
     }
 }
 
@@ -82,52 +107,55 @@ impl NonStdCompat {
 /// `def`-based recursive definitions baked into `jaq-core`'s own trusted
 /// prelude (`defs.jq`), not native functions reachable via this table, so
 /// they can't be filtered out this way without forking and hand-maintaining
-/// a trimmed copy of that prelude. [`JQ_EXEC_TIMEOUT`] is what actually
-/// bounds those (and any other unbounded-looping construct).
+/// a trimmed copy of that prelude. [`contains_denylisted_ident`] is the
+/// (heuristic, best-effort) mitigation for those instead.
 const EXCLUDED_FUNS: &[&str] = &["env", "now"];
 
-/// Serialized jq output larger than this is rejected. Guards against a
-/// filter that terminates within [`JQ_EXEC_TIMEOUT`] but produces an
-/// excessively large result.
-const JQ_MAX_OUTPUT_BYTES: usize = 64 * 1024;
-
-/// Hard wall-clock budget for a single jq filter execution.
+/// Identifiers rejected outright if `filter_src` references them anywhere,
+/// checked by [`contains_denylisted_ident`]:
+/// - `def`: reshaping a request/response body never needs a custom
+///   function; rejecting `def` outright closes the most direct route to a
+///   user-authored infinite-recursion helper (e.g. `def f: f; f`).
+/// - `repeat`/`recurse`/`while`/`until`: `jaq-std`'s prelude-defined,
+///   `def`-based unbounded-iteration primitives (not reachable via
+///   [`EXCLUDED_FUNS`], since they aren't natives) - each of these *can*
+///   loop forever depending on how it's used (e.g. `repeat(f)` with no
+///   `limit(...)` around it, or a `while`/`until` condition that never
+///   flips), even without writing a custom `def` at all.
+/// - `infinite`: the usual building block for an unbounded `range` (e.g.
+///   `range(0; infinite)`), the other common no-`def` way to construct an
+///   endless generator.
 ///
-/// `jaq` has no built-in step, recursion-depth, or timeout budget — its
-/// evaluator will run a filter like `reduce repeat(1) as $x (0; .+1)`
-/// forever, using only prelude functions and core language syntax (no
-/// excludable builtin, no user-defined `def`). Since [`run_jq`] executes
-/// synchronously and is invoked from synchronous code called inline from
-/// async token-request futures, an unbounded loop would otherwise
-/// permanently block whichever async runtime worker thread happens to be
-/// polling it — and since that runtime is typically shared across an
-/// entire host process, this can escalate from "one login attempt hangs"
-/// to "the whole process wedges." Every execution therefore runs on its
-/// own dedicated thread, joined with this timeout; on timeout the orphaned
-/// thread is left to finish (or loop forever) in the background rather
-/// than being forcibly killed, since Rust has no safe mechanism to
-/// preempt a running thread. This bounds the *visible* impact to one
-/// failed request instead of an unbounded hang.
-const JQ_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// This is a **heuristic denylist, not a termination proof**: there's no
+/// way to statically prove an arbitrary jq filter terminates, and this
+/// list only covers jq's *named* unbounded-iteration constructs - it
+/// can't catch every possible way to write one (e.g. a degenerate
+/// `range(0; 1; 0)` with a zero step doesn't reference any denylisted
+/// identifier). It also over-rejects: every use of `repeat`/`recurse`/
+/// `while`/`until`/`infinite` is rejected, including ones that provably
+/// terminate (e.g. `while(. < 10; . + 1)`, or bare `recurse` over
+/// ordinary acyclic JSON) and even non-executable uses like an object key
+/// literally named `repeat` (`{repeat: 1}`) - this check can't distinguish
+/// those from a genuine infinite loop, since it's purely lexical, not an
+/// analysis of what the filter actually does. Filters are expected to be
+/// trusted, reviewed configuration rather than raw end-user input; this
+/// check is defense in depth on top of that, not a substitute for it.
+const DENYLISTED_IDENTS: &[&str] = &["def", "repeat", "recurse", "while", "until", "infinite"];
 
-/// Returns `true` if `filter_src` lexically contains a `def` (function
-/// definition) anywhere, including nested inside `(...)`/`[...]`/`{...}`
-/// blocks or string interpolation. Reshaping a request/response body never
-/// needs a custom function; rejecting `def` outright closes the most direct
-/// route to a user-authored infinite-recursion helper (e.g. `def f: f; f`)
-/// with a clear error instead of a timeout. This does not (and cannot, by
-/// itself) stop the prelude's own recursive functions (`repeat`/`recurse`/
-/// `while`/`until`) — see [`JQ_EXEC_TIMEOUT`] for that.
+/// Returns `true` if `filter_src` lexically contains any of
+/// [`DENYLISTED_IDENTS`] anywhere, including nested inside
+/// `(...)`/`[...]`/`{...}` blocks or string interpolation.
 ///
 /// Returns `false` (i.e. does not flag) on a lex error — an invalid filter
-/// still fails normally at the parse step in [`run_jq_inner`], with that
-/// step's own error message.
-fn contains_user_def(filter_src: &str) -> bool {
+/// still fails normally at the parse step in [`CompiledFilter::new`], with
+/// that step's own error message.
+#[cfg(feature = "nonstd-compat")]
+fn contains_denylisted_ident(filter_src: &str) -> bool {
     use jaq_core::load::lex::{Lexer, StrPart, Tok, Token};
 
     fn walk(tokens: &[Token<&str>]) -> bool {
         tokens.iter().any(|Token(s, tok)| match tok {
-            Tok::Word => *s == "def",
+            Tok::Word => DENYLISTED_IDENTS.contains(s),
             Tok::Block(inner) => walk(inner),
             Tok::Str(parts) => parts.iter().any(|part| match part {
                 StrPart::Term(inner) => walk(std::slice::from_ref(inner)),
@@ -143,110 +171,133 @@ fn contains_user_def(filter_src: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Compiles and runs a `jq` filter (via the pure-Rust `jaq` crate family)
-/// against a single JSON input, returning its first output value.
+/// A `jq` filter (run via the pure-Rust `jaq` crate family) parsed and
+/// compiled exactly once via [`CompiledFilter::new`], then run against as
+/// many JSON inputs as needed via [`CompiledFilter::run`].
 ///
-/// `filter_src` is untrusted config (see [`EXCLUDED_FUNS`] and
-/// [`JQ_EXEC_TIMEOUT`] for the specific protections this applies).
-#[cfg(feature = "nonstd-compat")]
-pub(crate) fn run_jq(
-    filter_src: &str,
-    input: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    if contains_user_def(filter_src) {
-        return Err(format!(
-            "jq filter {filter_src:?} defines a custom function (`def`), which is not allowed"
-        ));
-    }
-
-    let owned_filter_src = filter_src.to_owned();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(run_jq_inner(&owned_filter_src, input));
-    });
-    let output = rx
-        .recv_timeout(JQ_EXEC_TIMEOUT)
-        .map_err(|_| format!("jq filter {filter_src:?} execution exceeded {JQ_EXEC_TIMEOUT:?} timeout"))??;
-
-    let serialized_len = serde_json::to_vec(&output)
-        .map_err(|err| err.to_string())?
-        .len();
-    if serialized_len > JQ_MAX_OUTPUT_BYTES {
-        return Err(format!(
-            "jq filter {filter_src:?} output exceeded {JQ_MAX_OUTPUT_BYTES} bytes ({serialized_len} bytes)"
-        ));
-    }
-
-    Ok(output)
+/// `req_map`'s filter is expected to produce `{"content_type": ...,
+/// "body": ...}`: `content_type` selects how `body` is encoded into the
+/// outgoing request (currently `application/json` or
+/// `application/x-www-form-urlencoded` are supported), letting a filter
+/// reshape the request while still choosing either encoding. `res_map`'s
+/// filter is expected to produce the response body shape this crate's
+/// standard token/introspection response types deserialize from.
+pub(crate) struct CompiledFilter {
+    /// Kept only for error messages.
+    src: String,
+    #[cfg(feature = "nonstd-compat")]
+    filter: jaq_core::Filter<jaq_core::data::JustLut<jaq_json::Val>>,
 }
 
-fn run_jq_inner(filter_src: &str, input: serde_json::Value) -> Result<serde_json::Value, String> {
-    use jaq_core::load::{Arena, File, Loader};
-    use jaq_core::{data, unwrap_valr, Compiler, Ctx, Vars};
-    use jaq_json::Val;
+impl fmt::Debug for CompiledFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompiledFilter")
+            .field("src", &self.src)
+            .finish()
+    }
+}
 
-    let defs = jaq_core::defs()
-        .chain(jaq_std::defs())
-        .chain(jaq_json::defs());
-    let funs = jaq_core::funs()
-        .chain(jaq_std::funs())
-        .chain(jaq_json::funs())
-        .filter(|(name, ..)| !EXCLUDED_FUNS.contains(name));
+impl CompiledFilter {
+    /// Compiles a jq filter once (the expensive part: parses the whole
+    /// prelude alongside `filter_src`).
+    #[cfg(feature = "nonstd-compat")]
+    pub(crate) fn new(filter_src: &str) -> Result<Self, String> {
+        use jaq_core::load::{Arena, File, Loader};
+        use jaq_core::Compiler;
 
-    let loader = Loader::new(defs);
-    let arena = Arena::default();
-    let modules = loader
-        .load(
-            &arena,
-            File {
-                code: filter_src,
-                path: (),
-            },
-        )
-        .map_err(|err| format!("failed to parse jq filter {filter_src:?}: {err:?}"))?;
+        if contains_denylisted_ident(filter_src) {
+            return Err(format!(
+                "jq filter {filter_src:?} references a denylisted identifier ({DENYLISTED_IDENTS:?}); \
+                 custom function definitions and jq's named unbounded-iteration primitives are not allowed"
+            ));
+        }
 
-    let filter = Compiler::default()
-        .with_funs(funs)
-        .compile(modules)
-        .map_err(|err| format!("failed to compile jq filter {filter_src:?}: {err:?}"))?;
+        let defs = jaq_core::defs()
+            .chain(jaq_std::defs())
+            .chain(jaq_json::defs());
+        let funs = jaq_core::funs()
+            .chain(jaq_std::funs())
+            .chain(jaq_json::funs())
+            .filter(|(name, ..)| !EXCLUDED_FUNS.contains(name));
 
-    let input: Val = serde_json::from_value(input).map_err(|err| err.to_string())?;
-    let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
+        let loader = Loader::new(defs);
+        let arena = Arena::default();
+        let modules = loader
+            .load(
+                &arena,
+                File {
+                    code: filter_src,
+                    path: (),
+                },
+            )
+            .map_err(|err| format!("failed to parse jq filter {filter_src:?}: {err:?}"))?;
 
-    let output = filter
-        .id
-        .run((ctx, input))
-        .map(unwrap_valr)
-        .next()
-        .ok_or_else(|| format!("jq filter {filter_src:?} produced no output"))?
-        .map_err(|err| format!("jq filter {filter_src:?} failed at runtime: {err:?}"))?;
+        let filter = Compiler::default()
+            .with_funs(funs)
+            .compile(modules)
+            .map_err(|err| format!("failed to compile jq filter {filter_src:?}: {err:?}"))?;
+        // `arena`/`modules` borrow `filter_src`; `filter` does not, so they
+        // drop here while the self-contained program graph lives on.
 
-    serde_json::from_str(&output.to_string()).map_err(|err| err.to_string())
+        Ok(Self {
+            src: filter_src.to_owned(),
+            filter,
+        })
+    }
+
+    /// Runs the compiled filter against one JSON input, returning its first
+    /// output value.
+    #[cfg(feature = "nonstd-compat")]
+    pub(crate) fn run(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+        use jaq_core::{data, unwrap_valr, Ctx, Vars};
+        use jaq_json::Val;
+
+        let input: Val = serde_json::from_value(input).map_err(|err| err.to_string())?;
+        let ctx = Ctx::<data::JustLut<Val>>::new(&self.filter.lut, Vars::new([]));
+
+        let output = self
+            .filter
+            .id
+            .run((ctx, input))
+            .map(unwrap_valr)
+            .next()
+            .ok_or_else(|| format!("jq filter {:?} produced no output", self.src))?
+            .map_err(|err| format!("jq filter {:?} failed at runtime: {err:?}", self.src))?;
+
+        serde_json::from_str(&output.to_string()).map_err(|err| err.to_string())
+    }
 }
 
 #[cfg(all(test, feature = "nonstd-compat"))]
 mod tests {
     use super::*;
 
+    fn run(filter_src: &str, input: serde_json::Value) -> Result<serde_json::Value, String> {
+        CompiledFilter::new(filter_src)?.run(input)
+    }
+
     #[test]
     fn runs_a_simple_filter() {
-        let output = run_jq("del(.grant_type)", serde_json::json!({
-            "grant_type": "client_credentials",
-            "client_id": "test",
-        }))
+        let output = run(
+            "del(.grant_type)",
+            serde_json::json!({
+                "grant_type": "client_credentials",
+                "client_id": "test",
+            }),
+        )
         .unwrap();
         assert_eq!(output, serde_json::json!({"client_id": "test"}));
     }
 
     #[test]
     fn compile_error_is_reported() {
-        let err = run_jq("this is not jq", serde_json::json!({})).unwrap_err();
+        let err = run("this is not jq", serde_json::json!({})).unwrap_err();
         assert!(err.contains("failed to"), "unexpected error: {err}");
     }
 
     #[test]
     fn runtime_error_is_reported() {
-        let err = run_jq(r#"error("boom")"#, serde_json::json!({})).unwrap_err();
+        let err = run(r#"error("boom")"#, serde_json::json!({})).unwrap_err();
         assert!(
             err.contains("failed at runtime"),
             "unexpected error: {err}"
@@ -255,7 +306,7 @@ mod tests {
 
     #[test]
     fn env_is_not_available() {
-        let err = run_jq("env", serde_json::json!({})).unwrap_err();
+        let err = run("env", serde_json::json!({})).unwrap_err();
         assert!(
             err.contains("failed to compile"),
             "expected a compile error since `env` should be undefined, got: {err}"
@@ -264,7 +315,7 @@ mod tests {
 
     #[test]
     fn now_is_not_available() {
-        let err = run_jq("now", serde_json::json!({})).unwrap_err();
+        let err = run("now", serde_json::json!({})).unwrap_err();
         assert!(
             err.contains("failed to compile"),
             "expected a compile error since `now` should be undefined, got: {err}"
@@ -273,9 +324,9 @@ mod tests {
 
     #[test]
     fn user_defined_functions_are_rejected() {
-        let err = run_jq("def f: f; f", serde_json::json!({})).unwrap_err();
+        let err = run("def f: f; f", serde_json::json!({})).unwrap_err();
         assert!(
-            err.contains("defines a custom function"),
+            err.contains("denylisted identifier"),
             "unexpected error: {err}"
         );
     }
@@ -285,36 +336,70 @@ mod tests {
         // `def` doesn't have to appear at the top level of the filter to be
         // dangerous - it just has to be reachable by the lexer, including
         // inside a parenthesized/bracketed/braced block.
-        let err = run_jq("[(def f: f; f)]", serde_json::json!({})).unwrap_err();
+        let err = run("[(def f: f; f)]", serde_json::json!({})).unwrap_err();
         assert!(
-            err.contains("defines a custom function"),
+            err.contains("denylisted identifier"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn unbounded_execution_times_out() {
-        // Uses only prelude functions (`repeat`) and core language syntax
-        // (`reduce ... as $x (...)`) - no excluded builtin, no user `def` -
-        // proving layers B/C alone don't stop unbounded recursion, and that
-        // the execution timeout is the thing that actually bounds it.
-        let err = run_jq(
-            "reduce repeat(1) as $x (0; .+1)",
-            serde_json::json!({}),
+    fn chained_pipe_filters_are_not_falsely_rejected() {
+        // Piping through multiple stages (`|`), including update-assignment
+        // (`|=`), doesn't reference any denylisted identifier and must not
+        // be mistaken for one by `contains_denylisted_ident`.
+        let output = run(
+            r#".token |= split("\n")[0] | .expiry |= split(".")[0]"#,
+            serde_json::json!({"token": "abc\ndef", "expiry": "123.456"}),
         )
-        .unwrap_err();
-        assert!(
-            err.contains("timeout"),
-            "expected a timeout error, got: {err}"
-        );
+        .unwrap();
+        assert_eq!(output, serde_json::json!({"token": "abc", "expiry": "123"}));
     }
 
     #[test]
-    fn oversized_output_is_rejected() {
-        let err = run_jq("[range(0;50000)]", serde_json::json!({})).unwrap_err();
-        assert!(
-            err.contains("exceeded") && err.contains("bytes"),
-            "unexpected error: {err}"
+    fn known_unbounded_loop_patterns_are_rejected_at_compile_time() {
+        // Without any custom `def`, these are the standard ways to build an
+        // endless computation in jq; `contains_denylisted_ident` catches
+        // each by name rather than letting it run and hang the request.
+        for filter_src in [
+            "reduce repeat(1) as $x (0; .+1)",
+            "recurse(.+1)",
+            "while(true; .)",
+            "until(false; .)",
+            "[limit(5; range(0; infinite))]",
+        ] {
+            let err = run(filter_src, serde_json::json!(0)).unwrap_err();
+            assert!(
+                err.contains("denylisted identifier"),
+                "expected {filter_src:?} to be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn denylist_check_is_heuristic_and_over_rejects() {
+        // Documented limitation: a provably-terminating use of a
+        // denylisted identifier is still rejected, since the check is
+        // purely lexical.
+        let err = run("while(. < 10; . + 1)", serde_json::json!(0)).unwrap_err();
+        assert!(err.contains("denylisted identifier"));
+
+        // Likewise a non-executable use, like an object-construction key
+        // that happens to share a denylisted name.
+        let err = run("{repeat: 1}", serde_json::json!({})).unwrap_err();
+        assert!(err.contains("denylisted identifier"));
+    }
+
+    #[test]
+    fn compiled_filter_can_be_run_multiple_times() {
+        let filter = CompiledFilter::new("{renamed: .value}").unwrap();
+        assert_eq!(
+            filter.run(serde_json::json!({"value": 1})).unwrap(),
+            serde_json::json!({"renamed": 1})
+        );
+        assert_eq!(
+            filter.run(serde_json::json!({"value": 2})).unwrap(),
+            serde_json::json!({"renamed": 2})
         );
     }
 }

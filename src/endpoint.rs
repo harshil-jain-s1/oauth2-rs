@@ -150,38 +150,92 @@ pub(crate) fn endpoint_request<'a>(
             .as_slice(),
     );
 
-    let req_map = nonstd_compat.and_then(|c| c.req_map.as_deref());
+    let req_map = nonstd_compat.and_then(|c| c.req_map.as_ref());
 
     #[cfg(feature = "nonstd-compat")]
-    if let Some(filter) = req_map {
-        let json_params = serde_json::Value::Object(
-            params
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
-                .collect(),
-        );
-        let mapped = crate::nonstd::run_jq(filter, json_params)?;
-        let body = serde_json::to_vec(&mapped).map_err(|e| e.to_string())?;
-        return builder
-            .header(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON))
-            .body(body)
-            .map_err(|e| e.to_string());
-    }
+    let (content_type, body): (String, Vec<u8>) = match req_map {
+        Some(filter) => {
+            let json_params = serde_json::Value::Object(
+                params
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                    .collect(),
+            );
+            let mapped = filter.run(json_params)?;
+            req_map_output_to_body(mapped)?
+        }
+        None => (
+            CONTENT_TYPE_FORMENCODED.to_string(),
+            encode_form_params(params),
+        ),
+    };
     #[cfg(not(feature = "nonstd-compat"))]
-    let _ = req_map;
-
-    let body = form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(params)
-        .finish()
-        .into_bytes();
+    let (content_type, body): (String, Vec<u8>) = {
+        let _ = req_map;
+        (CONTENT_TYPE_FORMENCODED.to_string(), encode_form_params(params))
+    };
 
     builder
         .header(
             CONTENT_TYPE,
-            HeaderValue::from_static(CONTENT_TYPE_FORMENCODED),
+            HeaderValue::from_str(&content_type).map_err(|e| e.to_string())?,
         )
         .body(body)
         .map_err(|e| e.to_string())
+}
+
+/// Form-urlencodes `pairs` into a request body, the same way for both the
+/// standard (no `nonstd_compat`) path and a `req_map` filter that opts into
+/// `application/x-www-form-urlencoded` output.
+fn encode_form_params<I, K, V>(pairs: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
+        .into_bytes()
+}
+
+/// Interprets a `req_map` filter's output as `{"content_type": ...,
+/// "body": ...}`, returning the header value and the encoded request body.
+/// Only `application/json` and `application/x-www-form-urlencoded` are
+/// supported: JSON `body` is serialized directly; form-encoded `body` must
+/// be a flat object of string-ish values, encoded via [`encode_form_params`]
+/// exactly like the standard (non-`req_map`) path.
+#[cfg(feature = "nonstd-compat")]
+fn req_map_output_to_body(mapped: serde_json::Value) -> Result<(String, Vec<u8>), String> {
+    let content_type = mapped
+        .get("content_type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("req_map output missing string field \"content_type\": {mapped}"))?
+        .to_string();
+    let body_value = mapped
+        .get("body")
+        .ok_or_else(|| format!("req_map output missing field \"body\": {mapped}"))?;
+
+    if content_type == CONTENT_TYPE_JSON {
+        let body = serde_json::to_vec(body_value).map_err(|e| e.to_string())?;
+        Ok((content_type, body))
+    } else if content_type == CONTENT_TYPE_FORMENCODED {
+        let obj = body_value.as_object().ok_or_else(|| {
+            format!(
+                "req_map \"body\" must be a JSON object when content_type is \
+                 {CONTENT_TYPE_FORMENCODED:?}, got: {body_value}"
+            )
+        })?;
+        let pairs = obj.iter().map(|(k, v)| {
+            let v = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            (k.clone(), v)
+        });
+        Ok((content_type, encode_form_params(pairs)))
+    } else {
+        Err(format!(
+            "req_map returned unsupported content_type {content_type:?}"
+        ))
+    }
 }
 
 pub(crate) fn endpoint_response<RE, TE, DO>(
@@ -203,12 +257,12 @@ where
     let response_body = http_response.body().as_slice();
 
     #[cfg(feature = "nonstd-compat")]
-    let mapped_body: Option<Vec<u8>> = match nonstd_compat.and_then(|c| c.res_map.as_deref()) {
+    let mapped_body: Option<Vec<u8>> = match nonstd_compat.and_then(|c| c.res_map.as_ref()) {
         Some(filter) => {
             let value: serde_json::Value = serde_json::from_slice(response_body).map_err(|e| {
                 RequestTokenError::Other(format!("res_map: response body is not JSON: {e}"))
             })?;
-            let mapped = crate::nonstd::run_jq(filter, value).map_err(RequestTokenError::Other)?;
+            let mapped = filter.run(value).map_err(RequestTokenError::Other)?;
             Some(serde_json::to_vec(&mapped).map_err(|e| {
                 RequestTokenError::Other(format!("res_map: failed to re-serialize: {e}"))
             })?)
@@ -341,7 +395,14 @@ mod tests {
         fn req_map_produces_a_json_body() {
             let client = new_client()
                 .set_auth_type(AuthType::RequestBody)
-                .set_nonstd_compat(NonStdCompat::new().with_req_map("del(.grant_type)"));
+                .set_nonstd_compat(
+                    NonStdCompat::new()
+                        .with_req_map(
+                            "{content_type: \"application/json\", body: del(.grant_type)}",
+                        )
+                        .build()
+                        .unwrap(),
+                );
 
             let http_response = Response::builder()
                 .status(StatusCode::OK)
@@ -377,10 +438,55 @@ mod tests {
         }
 
         #[test]
+        fn req_map_can_produce_a_form_encoded_body() {
+            let client = new_client().set_auth_type(AuthType::RequestBody).set_nonstd_compat(
+                NonStdCompat::new()
+                    .with_req_map(
+                        "{content_type: \"application/x-www-form-urlencoded\", \
+                          body: {clientId: .client_id, secret: .client_secret}}",
+                    )
+                    .build()
+                    .unwrap(),
+            );
+
+            let http_response = Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/json").unwrap(),
+                )
+                .body(
+                    "{\"access_token\": \"12/34\", \"token_type\": \"bearer\"}"
+                        .to_string()
+                        .into_bytes(),
+                )
+                .unwrap();
+
+            let token = client
+                .exchange_client_credentials()
+                .request(&move |request: crate::HttpRequest| {
+                    assert_eq!(
+                        request.headers().get(CONTENT_TYPE).unwrap(),
+                        "application/x-www-form-urlencoded"
+                    );
+                    assert_eq!(
+                        String::from_utf8(request.body().to_owned()).unwrap(),
+                        "clientId=aaa&secret=bbb"
+                    );
+                    Ok(http_response.clone()) as Result<_, FakeError>
+                })
+                .unwrap();
+
+            assert_eq!("12/34", token.access_token().secret());
+        }
+
+        #[test]
         fn res_map_transforms_response_before_deserializing() {
             let client = new_client().set_nonstd_compat(
                 NonStdCompat::new()
-                    .with_res_map("{access_token: .jwt, token_type: \"bearer\"}"),
+                    .with_res_map("{access_token: .jwt, token_type: \"bearer\"}")
+                    .build()
+                    .unwrap(),
             );
 
             let http_response = Response::builder()
@@ -434,15 +540,34 @@ mod tests {
         }
 
         #[test]
-        fn jq_error_surfaces_as_other() {
+        fn invalid_filter_fails_at_build_time() {
+            // Compile errors now surface as soon as `build()` runs, before the
+            // filter is ever attached to a `Client` - no network/request
+            // machinery involved at all.
+            let err = NonStdCompat::new()
+                .with_req_map("this is not jq")
+                .build()
+                .unwrap_err();
+
+            assert!(err.contains("failed to"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn req_map_runtime_error_surfaces_as_other() {
+            // A filter that compiles fine but fails at execution time (e.g.
+            // explicitly, via `error(...)`) should still surface through the
+            // normal request-preparation error path.
             let client = new_client().set_nonstd_compat(
-                NonStdCompat::new().with_req_map("this is not jq"),
+                NonStdCompat::new()
+                    .with_req_map(r#"error("boom")"#)
+                    .build()
+                    .unwrap(),
             );
 
             let err = client
                 .exchange_client_credentials()
                 .request(&move |_: crate::HttpRequest| -> Result<_, FakeError> {
-                    unreachable!("request should not be sent when req_map fails to compile")
+                    unreachable!("request should not be sent when req_map fails at runtime")
                 })
                 .unwrap_err();
 

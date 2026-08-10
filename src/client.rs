@@ -349,17 +349,6 @@ where
         self
     }
 
-    /// Conditionally set the [`NonStdCompat`] configuration used to talk to
-    /// non-standards-compliant token endpoints.
-    ///
-    /// Requires the "nonstd-compat" feature.
-    #[cfg(feature = "nonstd-compat")]
-    pub fn set_nonstd_compat_option(mut self, nonstd_compat: Option<NonStdCompat>) -> Self {
-        self.nonstd_compat = nonstd_compat;
-
-        self
-    }
-
     /// Set the [RFC 8628](https://tools.ietf.org/html/rfc8628) device authorization endpoint used
     /// for the Device Authorization Flow.
     ///

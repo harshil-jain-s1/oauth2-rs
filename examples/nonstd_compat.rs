@@ -1,6 +1,14 @@
 //! Demonstrates the `nonstd-compat` feature: talking to a token endpoint
 //! that doesn't quite follow RFC 6749.
 //!
+//! `req_map`'s filter must return `{"content_type": ..., "body": ...}`:
+//! `content_type` is either `"application/json"` or
+//! `"application/x-www-form-urlencoded"`, and `body` is encoded
+//! accordingly - so a filter can reshape the request while still choosing
+//! either encoding. `req_map`/`res_map` are compiled once via
+//! `NonStdCompat::build()`, so a broken filter fails immediately at
+//! `build()` time rather than on first use.
+//!
 //! ## Case 1: dropping a field and relaxing the response `Content-Type`
 //!
 //! A standard `client_credentials` request from this crate would
@@ -15,7 +23,8 @@
 //! responds with `Content-Type: application/vnd.provider+json` instead of
 //! `application/json`. `NonStdCompat` covers both, with no custom client
 //! code required: `req_map` runs `del(.grant_type)` over the JSON this
-//! crate would otherwise have form-encoded, and `res_type` relaxes the
+//! crate would otherwise have form-encoded (wrapped under `body`, with
+//! `content_type: "application/json"`), and `res_type` relaxes the
 //! response `Content-Type` check (and the `Accept` header sent).
 //!
 //! ## Case 2: renaming request/response fields
@@ -26,10 +35,10 @@
 //! "expiresIn": ...}` in the response instead of this crate's
 //! `access_token`/`refresh_token`/`expires_in`. Both directions are just
 //! jq filters:
-//! - `req_map`: `{clientId: .client_id, secret: .client_secret}` renames the
-//!   credential fields (and, since the filter doesn't reference them,
-//!   drops everything else this crate would otherwise have sent, such as
-//!   `grant_type`).
+//! - `req_map`: `{content_type: "application/json", body: {clientId:
+//!   .client_id, secret: .client_secret}}` renames the credential fields
+//!   (and, since the filter doesn't reference them, drops everything else
+//!   this crate would otherwise have sent, such as `grant_type`).
 //! - `res_map`: `{access_token: .jwt, token_type: "bearer", refresh_token:
 //!   .refreshToken, expires_in: .expiresIn}` renames the response fields
 //!   into the shape this crate's `StandardTokenResponse` expects,
@@ -46,29 +55,40 @@
 //! input field the filter doesn't reference (explicitly or via a merge)
 //! simply isn't in its output, and therefore never makes it into the
 //! request body:
-//! - `{clientId: .client_id, secret: .client_secret}` silently **drops**
-//!   an `audience` extra param, since the filter's output object never
-//!   mentions `.audience`.
-//! - `. as $in | {clientId: $in.client_id, secret: $in.secret} +
-//!   ($in | del(.client_id, .client_secret))` renames the credential
-//!   fields *and* **forwards** everything else (`audience`, `scope`, ...)
-//!   unchanged, by merging in the rest of the input object.
+//! - `{content_type: "application/json", body: {clientId: .client_id,
+//!   secret: .client_secret}}` silently **drops** an `audience` extra
+//!   param, since `body`'s output object never mentions `.audience`.
+//! - wrapping `. as $in | {clientId: $in.client_id, secret: $in.secret} +
+//!   ($in | del(.client_id, .client_secret))` under `body` renames the
+//!   credential fields *and* **forwards** everything else (`audience`,
+//!   `scope`, ...) unchanged, by merging in the rest of the input object.
 //!
 //! ## Case 4: reshaping scopes
 //!
 //! `add_scope()`/`add_scopes()` populate a single space-delimited `scope`
 //! field in `req_map`'s input, same as this crate would otherwise
 //! form-encode. A provider that wants scopes as a JSON array instead of a
-//! space-delimited string can reshape it in the filter, e.g. `{clientId:
-//! .client_id, secret: .client_secret, scope: (.scope | split(" "))}`.
+//! space-delimited string can reshape it in the filter, e.g. `body:
+//! {clientId: .client_id, secret: .client_secret, scope: (.scope |
+//! split(" "))}`.
 //!
-//! ## Case 5: an invalid filter fails fast, before any network call
+//! ## Case 5: an invalid filter fails fast, at `build()` time
 //!
-//! If `req_map` (or `res_map`) doesn't compile as jq, the request is never
-//! sent at all - preparing the request fails immediately with
-//! `RequestTokenError::Other`, wrapping the jq compiler's error message.
-//! This is useful to know when validating a provider config at startup,
-//! rather than only discovering a typo in a filter at request time.
+//! If `req_map` (or `res_map`) doesn't compile as jq, `NonStdCompat::build()`
+//! fails immediately with the jq compiler's error message - before the
+//! filter is even attached to a `Client`, let alone before any request is
+//! sent. This is useful to know when validating a provider config at
+//! startup, rather than only discovering a typo in a filter at request
+//! time.
+//!
+//! ## Case 6: keeping form-encoding while still reshaping the request
+//!
+//! `req_map` doesn't have to switch to a JSON body - returning
+//! `content_type: "application/x-www-form-urlencoded"` keeps the request
+//! form-encoded (exactly like the standard, no-`nonstd-compat` path) while
+//! still letting the filter rename/drop/add fields first, e.g. for a
+//! provider that's otherwise RFC 6749-compliant except for using
+//! `clientId`/`secret` instead of `client_id`/`client_secret`.
 //!
 //! ```sh
 //! cargo run --example nonstd_compat --features reqwest-blocking,nonstd-compat
@@ -93,8 +113,11 @@ fn main() {
     if let Err(err) = case_4_reshape_scopes_into_a_json_array() {
         eprintln!("case 4 failed (expected, since example.com isn't a real endpoint): {err}");
     }
-    if let Err(err) = case_5_invalid_filter_fails_before_any_network_call() {
-        eprintln!("case 5 failed as intended (invalid filter caught before sending): {err}");
+    if let Err(err) = case_5_invalid_filter_fails_at_build_time() {
+        eprintln!("case 5 failed as intended (invalid filter caught at build() time): {err}");
+    }
+    if let Err(err) = case_6_rename_fields_while_staying_form_encoded() {
+        eprintln!("case 6 failed (expected, since example.com isn't a real endpoint): {err}");
     }
 }
 
@@ -104,8 +127,11 @@ fn case_1_drop_field_and_relax_content_type() -> Result<(), Box<dyn std::error::
         .set_token_uri(TokenUrl::new("https://example.com/token".to_string())?)
         .set_nonstd_compat(
             NonStdCompat::new()
-                .with_req_map("del(.grant_type)")
-                .with_res_type("application/vnd.provider+json"),
+                .with_req_map(
+                    "{content_type: \"application/json\", body: del(.grant_type)}",
+                )
+                .with_res_type("application/vnd.provider+json")
+                .build()?,
         );
 
     let http_client = reqwest::blocking::ClientBuilder::new()
@@ -123,11 +149,15 @@ fn case_2_rename_request_and_response_fields() -> Result<(), Box<dyn std::error:
         .set_token_uri(TokenUrl::new("https://example.com/token".to_string())?)
         .set_nonstd_compat(
             NonStdCompat::new()
-                .with_req_map("{clientId: .client_id, secret: .client_secret}")
+                .with_req_map(
+                    "{content_type: \"application/json\", \
+                      body: {clientId: .client_id, secret: .client_secret}}",
+                )
                 .with_res_map(
                     "{access_token: .jwt, token_type: \"bearer\", \
                       refresh_token: .refreshToken, expires_in: .expiresIn}",
-                ),
+                )
+                .build()?,
         );
 
     let http_client = reqwest::blocking::ClientBuilder::new()
@@ -144,14 +174,19 @@ fn case_3a_extra_param_dropped_when_filter_ignores_it() -> Result<(), Box<dyn st
         .set_client_secret(ClientSecret::new("bbb".to_string()))
         .set_token_uri(TokenUrl::new("https://example.com/token".to_string())?)
         .set_nonstd_compat(
-            NonStdCompat::new().with_req_map("{clientId: .client_id, secret: .client_secret}"),
+            NonStdCompat::new()
+                .with_req_map(
+                    "{content_type: \"application/json\", \
+                      body: {clientId: .client_id, secret: .client_secret}}",
+                )
+                .build()?,
         );
 
     let http_client = reqwest::blocking::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
-    // `audience` never appears in the request body: the filter's output
+    // `audience` never appears in the request body: the filter's `body`
     // object only mentions `clientId`/`secret`.
     let token = client
         .exchange_client_credentials()
@@ -165,10 +200,15 @@ fn case_3b_extra_param_forwarded_via_merge() -> Result<(), Box<dyn std::error::E
     let client = BasicClient::new(ClientId::new("aaa".to_string()))
         .set_client_secret(ClientSecret::new("bbb".to_string()))
         .set_token_uri(TokenUrl::new("https://example.com/token".to_string())?)
-        .set_nonstd_compat(NonStdCompat::new().with_req_map(
-            ". as $in | {clientId: $in.client_id, secret: $in.secret} + \
-              ($in | del(.client_id, .client_secret))",
-        ));
+        .set_nonstd_compat(
+            NonStdCompat::new()
+                .with_req_map(
+                    "{content_type: \"application/json\", \
+                      body: (. as $in | {clientId: $in.client_id, secret: $in.secret} + \
+                             ($in | del(.client_id, .client_secret)))}",
+                )
+                .build()?,
+        );
 
     let http_client = reqwest::blocking::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
@@ -189,9 +229,15 @@ fn case_4_reshape_scopes_into_a_json_array() -> Result<(), Box<dyn std::error::E
     let client = BasicClient::new(ClientId::new("aaa".to_string()))
         .set_client_secret(ClientSecret::new("bbb".to_string()))
         .set_token_uri(TokenUrl::new("https://example.com/token".to_string())?)
-        .set_nonstd_compat(NonStdCompat::new().with_req_map(
-            "{clientId: .client_id, secret: .client_secret, scope: (.scope | split(\" \"))}",
-        ));
+        .set_nonstd_compat(
+            NonStdCompat::new()
+                .with_req_map(
+                    "{content_type: \"application/json\", \
+                      body: {clientId: .client_id, secret: .client_secret, \
+                             scope: (.scope | split(\" \"))}}",
+                )
+                .build()?,
+        );
 
     let http_client = reqwest::blocking::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
@@ -209,20 +255,38 @@ fn case_4_reshape_scopes_into_a_json_array() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-fn case_5_invalid_filter_fails_before_any_network_call() -> Result<(), Box<dyn std::error::Error>>
-{
+fn case_5_invalid_filter_fails_at_build_time() -> Result<(), Box<dyn std::error::Error>> {
+    // Fails right here, at `.build()` - the filter is never attached to a
+    // `Client`, and no HTTP client is even constructed.
+    let _nonstd_compat = NonStdCompat::new()
+        .with_req_map("this is not valid jq")
+        .build()?;
+
+    unreachable!("build() should have failed above");
+}
+
+fn case_6_rename_fields_while_staying_form_encoded() -> Result<(), Box<dyn std::error::Error>> {
     let client = BasicClient::new(ClientId::new("aaa".to_string()))
         .set_client_secret(ClientSecret::new("bbb".to_string()))
         .set_token_uri(TokenUrl::new("https://example.com/token".to_string())?)
-        .set_nonstd_compat(NonStdCompat::new().with_req_map("this is not valid jq"));
+        .set_nonstd_compat(
+            NonStdCompat::new()
+                .with_req_map(
+                    "{content_type: \"application/x-www-form-urlencoded\", \
+                      body: {clientId: .client_id, secret: .client_secret, \
+                             grant_type: .grant_type}}",
+                )
+                .build()?,
+        );
 
     let http_client = reqwest::blocking::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
-    // Fails while preparing the request (jq fails to compile the
-    // filter) - the HTTP client above is never actually called.
+    // Still form-encoded on the wire (`clientId=aaa&secret=bbb&grant_type=...`),
+    // just with renamed keys - no JSON body required for this kind of
+    // non-standard provider.
     let token = client.exchange_client_credentials().request(&http_client)?;
-    println!("case 5 token: {token:?}");
+    println!("case 6 token: {token:?}");
     Ok(())
 }
