@@ -25,18 +25,41 @@ use std::sync::Arc;
 /// Actually applying `req_map`/`res_map` (via the pure-Rust `jaq` jq engine)
 /// requires the `nonstd-compat` feature; the setters that populate this
 /// struct's fields are gated on that feature.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct NonStdCompat {
     req_map_src: Option<String>,
     res_map_src: Option<String>,
     pub(crate) req_map: Option<Arc<CompiledFilter>>,
     pub(crate) res_map: Option<Arc<CompiledFilter>>,
     pub(crate) res_type: Option<String>,
+    denylisted_idents: Vec<String>,
+}
+
+// Not `#[derive(Default)]`: a derived Default would silently zero
+// `denylisted_idents` to an empty Vec (i.e. no protection at all) for
+// anyone using `NonStdCompat::new()`/`::default()` without an explicit
+// `with_denylisted_idents` call. Populate it from `DEFAULT_DENYLISTED_IDENTS`
+// instead, so the out-of-the-box default stays protected.
+impl Default for NonStdCompat {
+    fn default() -> Self {
+        Self {
+            req_map_src: None,
+            res_map_src: None,
+            req_map: None,
+            res_map: None,
+            res_type: None,
+            denylisted_idents: DEFAULT_DENYLISTED_IDENTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
 }
 
 impl NonStdCompat {
-    /// Creates an empty configuration; use the `with_*` methods to set
-    /// individual fields, then [`Self::build`] to compile the filters.
+    /// Creates a configuration with [`DEFAULT_DENYLISTED_IDENTS`] and no
+    /// filters set; use the `with_*` methods to set individual fields, then
+    /// [`Self::build`] to compile the filters.
     pub fn new() -> Self {
         Self::default()
     }
@@ -63,6 +86,24 @@ impl NonStdCompat {
         self
     }
 
+    /// Overrides [`DEFAULT_DENYLISTED_IDENTS`] wholesale (not additive) — the
+    /// identifiers [`Self::build`] rejects `req_map`/`res_map` for referencing
+    /// anywhere. Rarely needed: removing an entry (e.g. `"recurse"`) removes
+    /// that specific protection for *this* filter pair, so only do so for a
+    /// specific, reviewed reason (e.g. a trusted, reviewed filter that
+    /// legitimately needs a provably-bounded `recurse`). Adding entries beyond
+    /// the default set is a no-op unless the filter would otherwise reference
+    /// that identifier. See the default list's own docs for why this check is
+    /// a heuristic, not a termination proof.
+    pub fn with_denylisted_idents<I, S>(mut self, idents: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.denylisted_idents = idents.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Compiles any `req_map`/`res_map` jq filter source set via `with_*`
     /// into a [`CompiledFilter`], so it's parsed and compiled exactly once
     /// rather than on every request/response. Returns the first compile
@@ -74,10 +115,10 @@ impl NonStdCompat {
     #[cfg(feature = "nonstd-compat")]
     pub fn build(mut self) -> Result<Self, String> {
         if let Some(src) = self.req_map_src.take() {
-            self.req_map = Some(Arc::new(CompiledFilter::new(&src)?));
+            self.req_map = Some(Arc::new(CompiledFilter::new(&src, &self.denylisted_idents)?));
         }
         if let Some(src) = self.res_map_src.take() {
-            self.res_map = Some(Arc::new(CompiledFilter::new(&src)?));
+            self.res_map = Some(Arc::new(CompiledFilter::new(&src, &self.denylisted_idents)?));
         }
         Ok(self)
     }
@@ -111,8 +152,10 @@ impl NonStdCompat {
 /// (heuristic, best-effort) mitigation for those instead.
 const EXCLUDED_FUNS: &[&str] = &["env", "now"];
 
-/// Identifiers rejected outright if `filter_src` references them anywhere,
-/// checked by [`contains_denylisted_ident`]:
+/// Default identifiers [`NonStdCompat::build`] rejects `req_map`/`res_map`
+/// for referencing anywhere, checked by [`contains_denylisted_ident`].
+/// Override via [`NonStdCompat::with_denylisted_idents`].
+///
 /// - `def`: reshaping a request/response body never needs a custom
 ///   function; rejecting `def` outright closes the most direct route to a
 ///   user-authored infinite-recursion helper (e.g. `def f: f; f`).
@@ -140,25 +183,26 @@ const EXCLUDED_FUNS: &[&str] = &["env", "now"];
 /// analysis of what the filter actually does. Filters are expected to be
 /// trusted, reviewed configuration rather than raw end-user input; this
 /// check is defense in depth on top of that, not a substitute for it.
-const DENYLISTED_IDENTS: &[&str] = &["def", "repeat", "recurse", "while", "until", "infinite"];
+pub const DEFAULT_DENYLISTED_IDENTS: &[&str] =
+    &["def", "repeat", "recurse", "while", "until", "infinite"];
 
 /// Returns `true` if `filter_src` lexically contains any of
-/// [`DENYLISTED_IDENTS`] anywhere, including nested inside
+/// `denylisted_idents` anywhere, including nested inside
 /// `(...)`/`[...]`/`{...}` blocks or string interpolation.
 ///
 /// Returns `false` (i.e. does not flag) on a lex error — an invalid filter
 /// still fails normally at the parse step in [`CompiledFilter::new`], with
 /// that step's own error message.
 #[cfg(feature = "nonstd-compat")]
-fn contains_denylisted_ident(filter_src: &str) -> bool {
+fn contains_denylisted_ident(filter_src: &str, denylisted_idents: &[String]) -> bool {
     use jaq_core::load::lex::{Lexer, StrPart, Tok, Token};
 
-    fn walk(tokens: &[Token<&str>]) -> bool {
+    fn walk(tokens: &[Token<&str>], denylisted_idents: &[String]) -> bool {
         tokens.iter().any(|Token(s, tok)| match tok {
-            Tok::Word => DENYLISTED_IDENTS.contains(s),
-            Tok::Block(inner) => walk(inner),
+            Tok::Word => denylisted_idents.iter().any(|d| d == s),
+            Tok::Block(inner) => walk(inner, denylisted_idents),
             Tok::Str(parts) => parts.iter().any(|part| match part {
-                StrPart::Term(inner) => walk(std::slice::from_ref(inner)),
+                StrPart::Term(inner) => walk(std::slice::from_ref(inner), denylisted_idents),
                 _ => false,
             }),
             _ => false,
@@ -167,7 +211,7 @@ fn contains_denylisted_ident(filter_src: &str) -> bool {
 
     Lexer::new(filter_src)
         .lex()
-        .map(|tokens| walk(&tokens))
+        .map(|tokens| walk(&tokens, denylisted_idents))
         .unwrap_or(false)
 }
 
@@ -199,15 +243,17 @@ impl fmt::Debug for CompiledFilter {
 
 impl CompiledFilter {
     /// Compiles a jq filter once (the expensive part: parses the whole
-    /// prelude alongside `filter_src`).
+    /// prelude alongside `filter_src`), rejecting it outright if it
+    /// references any of `denylisted_idents`
+    /// (see [`NonStdCompat::with_denylisted_idents`]).
     #[cfg(feature = "nonstd-compat")]
-    pub(crate) fn new(filter_src: &str) -> Result<Self, String> {
+    pub(crate) fn new(filter_src: &str, denylisted_idents: &[String]) -> Result<Self, String> {
         use jaq_core::load::{Arena, File, Loader};
         use jaq_core::Compiler;
 
-        if contains_denylisted_ident(filter_src) {
+        if contains_denylisted_ident(filter_src, denylisted_idents) {
             return Err(format!(
-                "jq filter {filter_src:?} references a denylisted identifier ({DENYLISTED_IDENTS:?}); \
+                "jq filter {filter_src:?} references a denylisted identifier ({denylisted_idents:?}); \
                  custom function definitions and jq's named unbounded-iteration primitives are not allowed"
             ));
         }
@@ -272,8 +318,12 @@ impl CompiledFilter {
 mod tests {
     use super::*;
 
+    fn default_denylist() -> Vec<String> {
+        DEFAULT_DENYLISTED_IDENTS.iter().map(|s| s.to_string()).collect()
+    }
+
     fn run(filter_src: &str, input: serde_json::Value) -> Result<serde_json::Value, String> {
-        CompiledFilter::new(filter_src)?.run(input)
+        CompiledFilter::new(filter_src, &default_denylist())?.run(input)
     }
 
     #[test]
@@ -391,8 +441,60 @@ mod tests {
     }
 
     #[test]
+    fn default_denylist_rejects_repeat_without_override() {
+        // Exercises the actual public NonStdCompat::default()/new() path (not
+        // the `run()`/`default_denylist()` test helpers above), so a
+        // regression back to a derived `Default` (which would silently zero
+        // `denylisted_idents`, disabling this check for everyone) would show
+        // up here as this test *failing to fail*.
+        let err = NonStdCompat::new()
+            .with_req_map("[limit(3; repeat(1))]")
+            .build()
+            .unwrap_err();
+        assert!(
+            err.contains("denylisted identifier"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn with_denylisted_idents_can_widen_to_allow_a_specific_construct() {
+        let idents: Vec<String> = DEFAULT_DENYLISTED_IDENTS
+            .iter()
+            .filter(|&&s| s != "repeat")
+            .map(|s| s.to_string())
+            .collect();
+        let compat = NonStdCompat::new()
+            .with_req_map("[limit(3; repeat(1))]")
+            .with_denylisted_idents(idents)
+            .build()
+            .expect("repeat should be allowed once removed from the denylist");
+        let output = compat
+            .req_map
+            .expect("req_map should be compiled")
+            .run(serde_json::json!({}))
+            .unwrap();
+        assert_eq!(output, serde_json::json!([1, 1, 1]));
+    }
+
+    #[test]
+    fn with_denylisted_idents_empty_disables_the_check_entirely() {
+        let compat = NonStdCompat::new()
+            .with_req_map("def f: .; f")
+            .with_denylisted_idents(Vec::<String>::new())
+            .build()
+            .expect("empty denylist should allow even `def`");
+        let output = compat
+            .req_map
+            .expect("req_map should be compiled")
+            .run(serde_json::json!({"a": 1}))
+            .unwrap();
+        assert_eq!(output, serde_json::json!({"a": 1}));
+    }
+
+    #[test]
     fn compiled_filter_can_be_run_multiple_times() {
-        let filter = CompiledFilter::new("{renamed: .value}").unwrap();
+        let filter = CompiledFilter::new("{renamed: .value}", &default_denylist()).unwrap();
         assert_eq!(
             filter.run(serde_json::json!({"value": 1})).unwrap(),
             serde_json::json!({"renamed": 1})

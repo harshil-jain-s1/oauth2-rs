@@ -539,7 +539,7 @@ pub use crate::error::{
 pub use crate::introspection::{
     IntrospectionRequest, StandardTokenIntrospectionResponse, TokenIntrospectionResponse,
 };
-pub use crate::nonstd::NonStdCompat;
+pub use crate::nonstd::{NonStdCompat, DEFAULT_DENYLISTED_IDENTS};
 pub use crate::revocation::{
     RevocableToken, RevocationErrorResponseType, RevocationRequest, StandardRevocableToken,
 };
