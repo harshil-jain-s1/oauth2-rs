@@ -215,21 +215,19 @@ fn req_map_output_to_body(mapped: serde_json::Value) -> Result<(Cow<'static, str
         return Err(format!("req_map output must be a JSON object, got: {mapped}"));
     };
     let content_type = match obj.remove("content_type") {
-        Some(serde_json::Value::String(s)) => s,
-        Some(other) => {
-            return Err(format!(
-                "req_map output field \"content_type\" must be a string, got: {other}"
-            ))
-        }
-        None => return Err("req_map output missing string field \"content_type\"".to_string()),
-    };
+        Some(serde_json::Value::String(s)) => Ok(s),
+        Some(other) => Err(format!(
+            "req_map output field \"content_type\" must be a string, got: {other}"
+        )),
+        None => Err("req_map output missing string field \"content_type\"".to_string()),
+    }?;
     let body_value = obj
         .remove("body")
         .ok_or_else(|| "req_map output missing field \"body\"".to_string())?;
 
     if content_type == CONTENT_TYPE_JSON {
         let body = serde_json::to_vec(&body_value).map_err(|e| e.to_string())?;
-        Ok((Cow::Owned(content_type), body))
+        Ok((Cow::Borrowed(CONTENT_TYPE_JSON), body))
     } else if content_type == CONTENT_TYPE_FORMENCODED {
         let serde_json::Value::Object(body_obj) = &body_value else {
             return Err(format!(
@@ -244,7 +242,7 @@ fn req_map_output_to_body(mapped: serde_json::Value) -> Result<(Cow<'static, str
             };
             (k.as_str(), v)
         });
-        Ok((Cow::Owned(content_type), encode_form_params(pairs)))
+        Ok((Cow::Borrowed(CONTENT_TYPE_FORMENCODED), encode_form_params(pairs)))
     } else {
         let encoded = body_value.as_str().ok_or_else(|| {
             format!(
@@ -324,7 +322,8 @@ where
 /// [`endpoint_response`]).
 #[cfg(feature = "nonstd-compat")]
 fn is_json_content_type(content_type: &str) -> bool {
-    content_type.to_lowercase().starts_with(CONTENT_TYPE_JSON)
+    let content_type = content_type.to_lowercase();
+    content_type.starts_with(CONTENT_TYPE_JSON) || content_type.ends_with("+json")
 }
 
 pub(crate) fn endpoint_response_status_only<RE, TE>(
@@ -700,6 +699,36 @@ mod tests {
                     );
                     Ok(http_response.clone()) as Result<_, FakeError>
                 })
+                .unwrap();
+
+            assert_eq!("12/34", token.access_token().secret());
+        }
+
+        #[test]
+        fn res_map_treats_a_vendor_json_content_type_as_json() {
+            // A `res_type` of `application/vnd.provider+json` is JSON (per
+            // RFC 6839's `+json` structured-syntax suffix), so a `res_map`
+            // filter should receive it parsed as JSON, not base64-encoded.
+            let client = new_client().set_nonstd_compat(
+                NonStdCompat::new()
+                    .with_res_type("application/vnd.provider+json")
+                    .with_res_map("{access_token: .jwt, token_type: \"bearer\"}")
+                    .build()
+                    .unwrap(),
+            );
+
+            let http_response = Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/vnd.provider+json").unwrap(),
+                )
+                .body("{\"jwt\": \"12/34\"}".to_string().into_bytes())
+                .unwrap();
+
+            let token = client
+                .exchange_client_credentials()
+                .request(&move |_| Ok(http_response.clone()) as Result<_, FakeError>)
                 .unwrap();
 
             assert_eq!("12/34", token.access_token().secret());
