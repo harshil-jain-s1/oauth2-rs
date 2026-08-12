@@ -221,11 +221,15 @@ fn contains_denylisted_ident(filter_src: &str, denylisted_idents: &[String]) -> 
 ///
 /// `req_map`'s filter is expected to produce `{"content_type": ...,
 /// "body": ...}`: `content_type` selects how `body` is encoded into the
-/// outgoing request (currently `application/json` or
-/// `application/x-www-form-urlencoded` are supported), letting a filter
-/// reshape the request while still choosing either encoding. `res_map`'s
+/// outgoing request - `application/json` and `application/x-www-form-urlencoded`
+/// are both understood directly, and any other `content_type` is supported
+/// too, provided `body` is given as a base64-encoded string of the raw
+/// bytes to send verbatim - letting a filter reshape the request while
+/// choosing whichever encoding the target endpoint expects. `res_map`'s
 /// filter is expected to produce the response body shape this crate's
-/// standard token/introspection response types deserialize from.
+/// standard token/introspection response types deserialize from; if the
+/// response isn't JSON, it's handed to the filter as a base64-encoded
+/// string instead of raw bytes.
 pub(crate) struct CompiledFilter {
     /// Kept only for error messages.
     src: String,

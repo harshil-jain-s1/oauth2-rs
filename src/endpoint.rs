@@ -153,7 +153,7 @@ pub(crate) fn endpoint_request<'a>(
     let req_map = nonstd_compat.and_then(|c| c.req_map.as_ref());
 
     #[cfg(feature = "nonstd-compat")]
-    let (content_type, body): (String, Vec<u8>) = match req_map {
+    let (content_type, body): (Cow<'static, str>, Vec<u8>) = match req_map {
         Some(filter) => {
             let json_params = serde_json::Value::Object(
                 params
@@ -165,14 +165,14 @@ pub(crate) fn endpoint_request<'a>(
             req_map_output_to_body(mapped)?
         }
         None => (
-            CONTENT_TYPE_FORMENCODED.to_string(),
+            Cow::Borrowed(CONTENT_TYPE_FORMENCODED),
             encode_form_params(params),
         ),
     };
     #[cfg(not(feature = "nonstd-compat"))]
-    let (content_type, body): (String, Vec<u8>) = {
+    let (content_type, body): (Cow<'static, str>, Vec<u8>) = {
         let _ = req_map;
-        (CONTENT_TYPE_FORMENCODED.to_string(), encode_form_params(params))
+        (Cow::Borrowed(CONTENT_TYPE_FORMENCODED), encode_form_params(params))
     };
 
     builder
@@ -200,41 +200,62 @@ where
 }
 
 /// Interprets a `req_map` filter's output as `{"content_type": ...,
-/// "body": ...}`, returning the header value and the encoded request body.
-/// Only `application/json` and `application/x-www-form-urlencoded` are
-/// supported: JSON `body` is serialized directly; form-encoded `body` must
-/// be a flat object of string-ish values, encoded via [`encode_form_params`]
-/// exactly like the standard (non-`req_map`) path.
+/// "body": ...}`, returning the header value and the encoded request body:
+/// - `application/json`: `body` is serialized directly.
+/// - `application/x-www-form-urlencoded`: `body` must be a flat object of
+///   string-ish values, encoded via [`encode_form_params`] exactly like the
+///   standard (non-`req_map`) path.
+/// - anything else: `body` must be a base64-encoded string, decoded and
+///   sent verbatim as the request body with `content_type` used as-is for
+///   the `Content-Type` header. This lets a filter emit arbitrary
+///   bytes/content-types this crate has no built-in knowledge of.
 #[cfg(feature = "nonstd-compat")]
-fn req_map_output_to_body(mapped: serde_json::Value) -> Result<(String, Vec<u8>), String> {
-    let content_type = mapped
-        .get("content_type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("req_map output missing string field \"content_type\": {mapped}"))?
-        .to_string();
-    let body_value = mapped
-        .get("body")
-        .ok_or_else(|| format!("req_map output missing field \"body\": {mapped}"))?;
+fn req_map_output_to_body(mapped: serde_json::Value) -> Result<(Cow<'static, str>, Vec<u8>), String> {
+    let serde_json::Value::Object(mut obj) = mapped else {
+        return Err(format!("req_map output must be a JSON object, got: {mapped}"));
+    };
+    let content_type = match obj.remove("content_type") {
+        Some(serde_json::Value::String(s)) => s,
+        Some(other) => {
+            return Err(format!(
+                "req_map output field \"content_type\" must be a string, got: {other}"
+            ))
+        }
+        None => return Err("req_map output missing string field \"content_type\"".to_string()),
+    };
+    let body_value = obj
+        .remove("body")
+        .ok_or_else(|| "req_map output missing field \"body\"".to_string())?;
 
     if content_type == CONTENT_TYPE_JSON {
-        let body = serde_json::to_vec(body_value).map_err(|e| e.to_string())?;
-        Ok((content_type, body))
+        let body = serde_json::to_vec(&body_value).map_err(|e| e.to_string())?;
+        Ok((Cow::Owned(content_type), body))
     } else if content_type == CONTENT_TYPE_FORMENCODED {
-        let obj = body_value.as_object().ok_or_else(|| {
-            format!(
+        let serde_json::Value::Object(body_obj) = &body_value else {
+            return Err(format!(
                 "req_map \"body\" must be a JSON object when content_type is \
                  {CONTENT_TYPE_FORMENCODED:?}, got: {body_value}"
+            ));
+        };
+        let pairs = body_obj.iter().map(|(k, v)| {
+            let v = match v.as_str() {
+                Some(s) => Cow::Borrowed(s),
+                None => Cow::Owned(v.to_string()),
+            };
+            (k.as_str(), v)
+        });
+        Ok((Cow::Owned(content_type), encode_form_params(pairs)))
+    } else {
+        let encoded = body_value.as_str().ok_or_else(|| {
+            format!(
+                "req_map \"body\" must be a base64-encoded string when content_type is \
+                 {content_type:?}, got: {body_value}"
             )
         })?;
-        let pairs = obj.iter().map(|(k, v)| {
-            let v = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
-            (k.clone(), v)
-        });
-        Ok((content_type, encode_form_params(pairs)))
-    } else {
-        Err(format!(
-            "req_map returned unsupported content_type {content_type:?}"
-        ))
+        let body = BASE64_STANDARD
+            .decode(encoded)
+            .map_err(|e| format!("req_map \"body\" is not valid base64: {e}"))?;
+        Ok((Cow::Owned(content_type), body))
     }
 }
 
@@ -257,25 +278,53 @@ where
     let response_body = http_response.body().as_slice();
 
     #[cfg(feature = "nonstd-compat")]
-    let mapped_body: Option<Vec<u8>> = match nonstd_compat.and_then(|c| c.res_map.as_ref()) {
+    match nonstd_compat.and_then(|c| c.res_map.as_ref()) {
         Some(filter) => {
-            let value: serde_json::Value = serde_json::from_slice(response_body).map_err(|e| {
-                RequestTokenError::Other(format!("res_map: response body is not JSON: {e}"))
-            })?;
+            let value = if is_json_content_type(expected_content_type) {
+                serde_json::from_slice(response_body).map_err(|e| {
+                    RequestTokenError::Other(format!("res_map: response body is not JSON: {e}"))
+                })?
+            } else {
+                serde_json::Value::String(BASE64_STANDARD.encode(response_body))
+            };
             let mapped = filter.run(value).map_err(RequestTokenError::Other)?;
-            Some(serde_json::to_vec(&mapped).map_err(|e| {
-                RequestTokenError::Other(format!("res_map: failed to re-serialize: {e}"))
-            })?)
+            serde_path_to_error::deserialize(&mapped).map_err(|e| {
+                let body = serde_json::to_vec(&mapped).unwrap_or_default();
+                RequestTokenError::Parse(e, body)
+            })
         }
-        None => None,
-    };
+        None => deserialize_response_body(response_body),
+    }
     #[cfg(not(feature = "nonstd-compat"))]
-    let mapped_body: Option<Vec<u8>> = None;
+    {
+        let _ = nonstd_compat;
+        deserialize_response_body(response_body)
+    }
+}
 
-    let response_body = mapped_body.as_deref().unwrap_or(response_body);
-
+/// Deserializes `response_body` (raw JSON bytes) into `DO`, the standard
+/// (no `res_map` involved) path — shared by the `res_map`-absent branch of
+/// [`endpoint_response`] and its `nonstd-compat`-disabled fallback.
+fn deserialize_response_body<RE, TE, DO>(
+    response_body: &[u8],
+) -> Result<DO, RequestTokenError<RE, TE>>
+where
+    RE: Error,
+    TE: ErrorResponse,
+    DO: DeserializeOwned,
+{
     serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_slice(response_body))
         .map_err(|e| RequestTokenError::Parse(e, response_body.to_vec()))
+}
+
+/// Case-insensitively checks whether `content_type` is (a prefix-match for)
+/// `application/json`, mirroring [`check_response_body`]'s own comparison
+/// style. Used to decide whether `res_map` should receive the raw response
+/// bytes parsed as JSON, or a base64-encoded string of those bytes (see
+/// [`endpoint_response`]).
+#[cfg(feature = "nonstd-compat")]
+fn is_json_content_type(content_type: &str) -> bool {
+    content_type.to_lowercase().starts_with(CONTENT_TYPE_JSON)
 }
 
 pub(crate) fn endpoint_response_status_only<RE, TE>(
@@ -478,6 +527,123 @@ mod tests {
                 .unwrap();
 
             assert_eq!("12/34", token.access_token().secret());
+        }
+
+        #[test]
+        fn req_map_arbitrary_content_type_base64_decodes_body() {
+            let client = new_client().set_auth_type(AuthType::RequestBody).set_nonstd_compat(
+                NonStdCompat::new()
+                    .with_req_map(
+                        "{content_type: \"application/octet-stream\", body: (.client_id | @base64)}",
+                    )
+                    .build()
+                    .unwrap(),
+            );
+
+            let http_response = Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/json").unwrap(),
+                )
+                .body(
+                    "{\"access_token\": \"12/34\", \"token_type\": \"bearer\"}"
+                        .to_string()
+                        .into_bytes(),
+                )
+                .unwrap();
+
+            let token = client
+                .exchange_client_credentials()
+                .request(&move |request: crate::HttpRequest| {
+                    assert_eq!(
+                        request.headers().get(CONTENT_TYPE).unwrap(),
+                        "application/octet-stream"
+                    );
+                    assert_eq!(request.body().as_slice(), b"aaa");
+                    Ok(http_response.clone()) as Result<_, FakeError>
+                })
+                .unwrap();
+
+            assert_eq!("12/34", token.access_token().secret());
+        }
+
+        #[test]
+        fn req_map_body_must_be_a_string_for_unknown_content_type() {
+            let client = new_client().set_nonstd_compat(
+                NonStdCompat::new()
+                    .with_req_map("{content_type: \"application/octet-stream\", body: 42}")
+                    .build()
+                    .unwrap(),
+            );
+
+            let err = client
+                .exchange_client_credentials()
+                .request(&move |_: crate::HttpRequest| -> Result<_, FakeError> {
+                    unreachable!("request should not be sent when body isn't base64-able")
+                })
+                .unwrap_err();
+
+            match err {
+                RequestTokenError::Other(msg) => {
+                    assert!(msg.contains("base64-encoded string"), "unexpected error: {msg}")
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn req_map_body_invalid_base64_errors() {
+            let client = new_client().set_nonstd_compat(
+                NonStdCompat::new()
+                    .with_req_map(
+                        "{content_type: \"application/octet-stream\", body: \"not valid base64!\"}",
+                    )
+                    .build()
+                    .unwrap(),
+            );
+
+            let err = client
+                .exchange_client_credentials()
+                .request(&move |_: crate::HttpRequest| -> Result<_, FakeError> {
+                    unreachable!("request should not be sent when body isn't valid base64")
+                })
+                .unwrap_err();
+
+            match err {
+                RequestTokenError::Other(msg) => {
+                    assert!(msg.contains("not valid base64"), "unexpected error: {msg}")
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn res_map_base64_decodes_non_json_response_body() {
+            let client = new_client().set_nonstd_compat(
+                NonStdCompat::new()
+                    .with_res_type("application/octet-stream")
+                    .with_res_map("{access_token: (. | @base64d), token_type: \"bearer\"}")
+                    .build()
+                    .unwrap(),
+            );
+
+            let raw_body = b"opaque-token-value".to_vec();
+            let http_response = Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/octet-stream").unwrap(),
+                )
+                .body(raw_body.clone())
+                .unwrap();
+
+            let token = client
+                .exchange_client_credentials()
+                .request(&move |_| Ok(http_response.clone()) as Result<_, FakeError>)
+                .unwrap();
+
+            assert_eq!(token.access_token().secret(), "opaque-token-value");
         }
 
         #[test]
