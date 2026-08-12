@@ -200,7 +200,10 @@ where
 }
 
 /// Interprets a `req_map` filter's output as `{"content_type": ...,
-/// "body": ...}`, returning the header value and the encoded request body:
+/// "body": ...}`, returning the header value and the encoded request body.
+/// `content_type` defaults to `application/json` if omitted entirely
+/// (matching `res_type`'s own default elsewhere in this file), so a filter
+/// that only cares about the common JSON case can just return `{body: ...}`:
 /// - `application/json`: `body` is serialized directly.
 /// - `application/x-www-form-urlencoded`: `body` must be a flat object of
 ///   string-ish values, encoded via [`encode_form_params`] exactly like the
@@ -219,7 +222,7 @@ fn req_map_output_to_body(mapped: serde_json::Value) -> Result<(Cow<'static, str
         Some(other) => Err(format!(
             "req_map output field \"content_type\" must be a string, got: {other}"
         )),
-        None => Err("req_map output missing string field \"content_type\"".to_string()),
+        None => Ok(CONTENT_TYPE_JSON.to_string()),
     }?;
     let body_value = obj
         .remove("body")
@@ -448,6 +451,50 @@ mod tests {
                         .with_req_map(
                             "{content_type: \"application/json\", body: del(.grant_type)}",
                         )
+                        .build()
+                        .unwrap(),
+                );
+
+            let http_response = Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/json").unwrap(),
+                )
+                .body(
+                    "{\"access_token\": \"12/34\", \"token_type\": \"bearer\"}"
+                        .to_string()
+                        .into_bytes(),
+                )
+                .unwrap();
+
+            let token = client
+                .exchange_client_credentials()
+                .request(&move |request: crate::HttpRequest| {
+                    assert_eq!(
+                        request.headers().get(CONTENT_TYPE).unwrap(),
+                        "application/json"
+                    );
+                    let body: serde_json::Value =
+                        serde_json::from_slice(request.body()).unwrap();
+                    assert_eq!(
+                        body,
+                        serde_json::json!({"client_id": "aaa", "client_secret": "bbb"})
+                    );
+                    Ok(http_response.clone()) as Result<_, FakeError>
+                })
+                .unwrap();
+
+            assert_eq!("12/34", token.access_token().secret());
+        }
+
+        #[test]
+        fn req_map_omitting_content_type_defaults_to_json() {
+            let client = new_client()
+                .set_auth_type(AuthType::RequestBody)
+                .set_nonstd_compat(
+                    NonStdCompat::new()
+                        .with_req_map("{body: del(.grant_type)}")
                         .build()
                         .unwrap(),
                 );
