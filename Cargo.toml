@@ -7,7 +7,7 @@ description = "An extensible, strongly-typed implementation of OAuth2"
 repository = "https://github.com/ramosbugs/oauth2-rs"
 edition = "2021"
 readme = "README.md"
-rust-version = "1.65"
+rust-version = "1.78"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -22,6 +22,7 @@ native-tls = ["reqwest/native-tls"]
 reqwest-blocking = ["reqwest/blocking"]
 rustls-tls = ["reqwest/rustls-tls"]
 timing-resistant-secret-traits = []
+nonstd-compat = ["dep:jaq-core", "dep:jaq-std", "dep:jaq-json"]
 
 [[example]]
 name = "github"
@@ -34,6 +35,10 @@ required-features = ["reqwest-blocking"]
 [[example]]
 name = "google_devicecode"
 required-features = ["reqwest-blocking"]
+
+[[example]]
+name = "nonstd_compat"
+required-features = ["reqwest-blocking", "nonstd-compat"]
 
 [[example]]
 name = "letterboxd"
@@ -60,6 +65,16 @@ ureq = { version = "2", optional = true }
 url = { version = "2.1", features = ["serde"] }
 chrono = { version = "0.4.31", default-features = false, features = ["clock", "serde", "std", "wasmbind"] }
 serde_path_to_error = "0.1.2"
+jaq-core = { version = "3", optional = true }
+jaq-std = { version = "3", optional = true, default-features = false, features = [
+    "std",
+    "format",
+    "log",
+    "math",
+    "regex",
+    "time",
+] }
+jaq-json = { version = "2", features = ["serde"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }

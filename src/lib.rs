@@ -496,6 +496,12 @@ pub mod helpers;
 
 mod introspection;
 
+/// Support for non-standard OAuth2-like providers via jq-style JSON
+/// transforms threaded through the standard `Client`/token-request
+/// machinery. Requires the "nonstd-compat" feature to actually apply any
+/// transform.
+mod nonstd;
+
 /// HTTP client backed by the [reqwest](https://crates.io/crates/reqwest) crate.
 /// Requires "reqwest" feature.
 #[cfg(any(feature = "reqwest", feature = "reqwest-blocking"))]
@@ -533,6 +539,7 @@ pub use crate::error::{
 pub use crate::introspection::{
     IntrospectionRequest, StandardTokenIntrospectionResponse, TokenIntrospectionResponse,
 };
+pub use crate::nonstd::{NonStdCompat, DEFAULT_DENYLISTED_IDENTS};
 pub use crate::revocation::{
     RevocableToken, RevocationErrorResponseType, RevocationRequest, StandardRevocableToken,
 };

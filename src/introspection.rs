@@ -1,8 +1,8 @@
 use crate::endpoint::{endpoint_request, endpoint_response};
 use crate::{
     AccessToken, AsyncHttpClient, AuthType, Client, ClientId, ClientSecret, EndpointState,
-    ErrorResponse, ExtraTokenFields, HttpRequest, IntrospectionUrl, RequestTokenError,
-    RevocableToken, Scope, SyncHttpClient, TokenResponse, TokenType,
+    ErrorResponse, ExtraTokenFields, HttpRequest, IntrospectionUrl, NonStdCompat,
+    RequestTokenError, RevocableToken, Scope, SyncHttpClient, TokenResponse, TokenType,
 };
 
 use chrono::serde::ts_seconds_option;
@@ -65,6 +65,7 @@ where
             introspection_url,
             token,
             token_type_hint: None,
+            nonstd_compat: self.nonstd_compat.as_ref(),
             _phantom: PhantomData,
         }
     }
@@ -86,6 +87,7 @@ where
     pub(crate) client_secret: Option<&'a ClientSecret>,
     pub(crate) extra_params: Vec<(Cow<'a, str>, Cow<'a, str>)>,
     pub(crate) introspection_url: &'a IntrospectionUrl,
+    pub(crate) nonstd_compat: Option<&'a NonStdCompat>,
     pub(crate) _phantom: PhantomData<(TE, TIR)>,
 }
 
@@ -156,6 +158,7 @@ where
             None,
             self.introspection_url.url(),
             params,
+            self.nonstd_compat,
         )
         .map_err(|err| RequestTokenError::Other(format!("failed to prepare request: {err}")))
     }
@@ -168,7 +171,8 @@ where
     where
         C: SyncHttpClient,
     {
-        endpoint_response(http_client.call(self.prepare_request()?)?)
+        let nonstd_compat = self.nonstd_compat;
+        endpoint_response(http_client.call(self.prepare_request()?)?, nonstd_compat)
     }
 
     /// Asynchronously sends the request to the authorization server and returns a Future.
@@ -180,7 +184,13 @@ where
         Self: 'c,
         C: AsyncHttpClient<'c>,
     {
-        Box::pin(async move { endpoint_response(http_client.call(self.prepare_request()?).await?) })
+        Box::pin(async move {
+            let nonstd_compat = self.nonstd_compat;
+            endpoint_response(
+                http_client.call(self.prepare_request()?).await?,
+                nonstd_compat,
+            )
+        })
     }
 }
 

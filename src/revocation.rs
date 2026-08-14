@@ -2,8 +2,8 @@ use crate::basic::BasicErrorResponseType;
 use crate::endpoint::{endpoint_request, endpoint_response_status_only};
 use crate::{
     AccessToken, AsyncHttpClient, AuthType, Client, ClientId, ClientSecret, ConfigurationError,
-    EndpointState, ErrorResponse, ErrorResponseType, HttpRequest, RefreshToken, RequestTokenError,
-    RevocationUrl, SyncHttpClient, TokenIntrospectionResponse, TokenResponse,
+    EndpointState, ErrorResponse, ErrorResponseType, HttpRequest, NonStdCompat, RefreshToken,
+    RequestTokenError, RevocationUrl, SyncHttpClient, TokenIntrospectionResponse, TokenResponse,
 };
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,7 @@ where
             extra_params: Vec::new(),
             revocation_url,
             token,
+            nonstd_compat: self.nonstd_compat.as_ref(),
             _phantom: PhantomData,
         })
     }
@@ -222,6 +223,7 @@ where
     pub(crate) client_secret: Option<&'a ClientSecret>,
     pub(crate) extra_params: Vec<(Cow<'a, str>, Cow<'a, str>)>,
     pub(crate) revocation_url: &'a RevocationUrl,
+    pub(crate) nonstd_compat: Option<&'a NonStdCompat>,
     pub(crate) _phantom: PhantomData<(RT, TE)>,
 }
 
@@ -270,6 +272,7 @@ where
             None,
             self.revocation_url.url(),
             params,
+            self.nonstd_compat,
         )
         .map_err(|err| RequestTokenError::Other(format!("failed to prepare request: {err}")))
     }
