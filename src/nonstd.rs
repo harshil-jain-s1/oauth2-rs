@@ -74,6 +74,13 @@ impl NonStdCompat {
 
     /// Sets the jq filter applied to the raw JSON response body before this
     /// crate's standard deserialization runs. Compiled by [`Self::build`].
+    ///
+    /// Runs for both successful and error (non-2xx) responses, with the
+    /// HTTP status code available as the `$status` variable, so the filter
+    /// can branch on it, e.g. `if $status == 200 then {..} else {error:
+    /// ..} end`. A filter that ignores `$status` and only handles the
+    /// success shape will have that same output parsed as the error type
+    /// on non-2xx responses too.
     pub fn with_res_map(mut self, res_map: impl Into<String>) -> Self {
         self.res_map_src = Some(res_map.into());
         self
@@ -115,10 +122,18 @@ impl NonStdCompat {
     #[cfg(feature = "nonstd-compat")]
     pub fn build(mut self) -> Result<Self, String> {
         if let Some(src) = self.req_map_src.take() {
-            self.req_map = Some(Arc::new(CompiledFilter::new(&src, &self.denylisted_idents)?));
+            self.req_map = Some(Arc::new(CompiledFilter::new(
+                &src,
+                &self.denylisted_idents,
+                &[],
+            )?));
         }
         if let Some(src) = self.res_map_src.take() {
-            self.res_map = Some(Arc::new(CompiledFilter::new(&src, &self.denylisted_idents)?));
+            self.res_map = Some(Arc::new(CompiledFilter::new(
+                &src,
+                &self.denylisted_idents,
+                &["$status"],
+            )?));
         }
         Ok(self)
     }
@@ -251,7 +266,11 @@ impl CompiledFilter {
     /// references any of `denylisted_idents`
     /// (see [`NonStdCompat::with_denylisted_idents`]).
     #[cfg(feature = "nonstd-compat")]
-    pub(crate) fn new(filter_src: &str, denylisted_idents: &[String]) -> Result<Self, String> {
+    pub(crate) fn new(
+        filter_src: &str,
+        denylisted_idents: &[String],
+        global_vars: &[&str],
+    ) -> Result<Self, String> {
         use jaq_core::load::{Arena, File, Loader};
         use jaq_core::Compiler;
 
@@ -284,6 +303,7 @@ impl CompiledFilter {
 
         let filter = Compiler::default()
             .with_funs(funs)
+            .with_global_vars(global_vars.iter().copied())
             .compile(modules)
             .map_err(|err| format!("failed to compile jq filter {filter_src:?}: {err:?}"))?;
         // `arena`/`modules` borrow `filter_src`; `filter` does not, so they
@@ -296,14 +316,26 @@ impl CompiledFilter {
     }
 
     /// Runs the compiled filter against one JSON input, returning its first
-    /// output value.
+    /// output value. `vars` supplies the values for any global vars the
+    /// filter was compiled with (via `NonStdCompat::build`), in the same
+    /// order they were declared.
     #[cfg(feature = "nonstd-compat")]
-    pub(crate) fn run(&self, input: serde_json::Value) -> Result<serde_json::Value, String> {
+    pub(crate) fn run(
+        &self,
+        input: serde_json::Value,
+        vars: &[serde_json::Value],
+    ) -> Result<serde_json::Value, String> {
         use jaq_core::{data, unwrap_valr, Ctx, Vars};
         use jaq_json::Val;
 
         let input: Val = serde_json::from_value(input).map_err(|err| err.to_string())?;
-        let ctx = Ctx::<data::JustLut<Val>>::new(&self.filter.lut, Vars::new([]));
+        let vars: Vec<Val> = vars
+            .iter()
+            .cloned()
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()
+            .map_err(|err| err.to_string())?;
+        let ctx = Ctx::<data::JustLut<Val>>::new(&self.filter.lut, Vars::new(vars));
 
         let output = self
             .filter
@@ -327,7 +359,7 @@ mod tests {
     }
 
     fn run(filter_src: &str, input: serde_json::Value) -> Result<serde_json::Value, String> {
-        CompiledFilter::new(filter_src, &default_denylist())?.run(input)
+        CompiledFilter::new(filter_src, &default_denylist(), &["$status"])?.run(input, &[serde_json::json!(200)])
     }
 
     #[test]
@@ -476,7 +508,7 @@ mod tests {
         let output = compat
             .req_map
             .expect("req_map should be compiled")
-            .run(serde_json::json!({}))
+            .run(serde_json::json!({}), &[])
             .unwrap();
         assert_eq!(output, serde_json::json!([1, 1, 1]));
     }
@@ -491,20 +523,20 @@ mod tests {
         let output = compat
             .req_map
             .expect("req_map should be compiled")
-            .run(serde_json::json!({"a": 1}))
+            .run(serde_json::json!({"a": 1}), &[])
             .unwrap();
         assert_eq!(output, serde_json::json!({"a": 1}));
     }
 
     #[test]
     fn compiled_filter_can_be_run_multiple_times() {
-        let filter = CompiledFilter::new("{renamed: .value}", &default_denylist()).unwrap();
+        let filter = CompiledFilter::new("{renamed: .value}", &default_denylist(), &[]).unwrap();
         assert_eq!(
-            filter.run(serde_json::json!({"value": 1})).unwrap(),
+            filter.run(serde_json::json!({"value": 1}), &[]).unwrap(),
             serde_json::json!({"renamed": 1})
         );
         assert_eq!(
-            filter.run(serde_json::json!({"value": 2})).unwrap(),
+            filter.run(serde_json::json!({"value": 2}), &[]).unwrap(),
             serde_json::json!({"renamed": 2})
         );
     }

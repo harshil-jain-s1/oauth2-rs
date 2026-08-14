@@ -161,7 +161,7 @@ pub(crate) fn endpoint_request<'a>(
                     .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
                     .collect(),
             );
-            let mapped = filter.run(json_params)?;
+            let mapped = filter.run(json_params, &[])?;
             req_map_output_to_body(mapped)?
         }
         None => (
@@ -269,6 +269,36 @@ where
     TE: ErrorResponse,
     DO: DeserializeOwned,
 {
+    #[cfg(feature = "nonstd-compat")]
+    if let Some(filter) = nonstd_compat.and_then(|c| c.res_map.as_ref()) {
+        let expected_content_type = nonstd_compat
+            .and_then(|c| c.res_type.as_deref())
+            .unwrap_or(CONTENT_TYPE_JSON);
+        if http_response.status().is_success() {
+            check_response_body(&http_response, expected_content_type)?;
+        }
+
+        let response_body = http_response.body().as_slice();
+        let value = if is_json_content_type(expected_content_type) {
+            serde_json::from_slice(response_body).map_err(|e| {
+                RequestTokenError::Other(format!("res_map: response body is not JSON: {e}"))
+            })?
+        } else {
+            serde_json::Value::String(BASE64_STANDARD.encode(response_body))
+        };
+        let status = serde_json::Value::from(http_response.status().as_u16());
+        let mapped = filter.run(value, &[status]).map_err(RequestTokenError::Other)?;
+
+        return if http_response.status().is_success() {
+            serde_path_to_error::deserialize(&mapped).map_err(|e| {
+                let body = serde_json::to_vec(&mapped).unwrap_or_default();
+                RequestTokenError::Parse(e, body)
+            })
+        } else {
+            Err(deserialize_error_response(&mapped))
+        };
+    }
+
     check_response_status(&http_response)?;
 
     let expected_content_type = nonstd_compat
@@ -277,30 +307,7 @@ where
     check_response_body(&http_response, expected_content_type)?;
 
     let response_body = http_response.body().as_slice();
-
-    #[cfg(feature = "nonstd-compat")]
-    match nonstd_compat.and_then(|c| c.res_map.as_ref()) {
-        Some(filter) => {
-            let value = if is_json_content_type(expected_content_type) {
-                serde_json::from_slice(response_body).map_err(|e| {
-                    RequestTokenError::Other(format!("res_map: response body is not JSON: {e}"))
-                })?
-            } else {
-                serde_json::Value::String(BASE64_STANDARD.encode(response_body))
-            };
-            let mapped = filter.run(value).map_err(RequestTokenError::Other)?;
-            serde_path_to_error::deserialize(&mapped).map_err(|e| {
-                let body = serde_json::to_vec(&mapped).unwrap_or_default();
-                RequestTokenError::Parse(e, body)
-            })
-        }
-        None => deserialize_response_body(response_body),
-    }
-    #[cfg(not(feature = "nonstd-compat"))]
-    {
-        let _ = nonstd_compat;
-        deserialize_response_body(response_body)
-    }
+    deserialize_response_body(response_body)
 }
 
 /// Deserializes `response_body` (raw JSON bytes) into `DO`, the standard
@@ -363,6 +370,24 @@ where
         }
     } else {
         Ok(())
+    }
+}
+
+/// Deserializes an already-mapped (`res_map`-transformed) JSON value into
+/// `TE`, mirroring what [`check_response_status`] does for the raw,
+/// unmapped error body.
+#[cfg(feature = "nonstd-compat")]
+fn deserialize_error_response<RE, TE>(value: &serde_json::Value) -> RequestTokenError<RE, TE>
+where
+    RE: Error,
+    TE: ErrorResponse,
+{
+    match serde_path_to_error::deserialize::<_, TE>(value) {
+        Ok(error) => RequestTokenError::ServerResponse(error),
+        Err(error) => {
+            let body = serde_json::to_vec(value).unwrap_or_default();
+            RequestTokenError::Parse(error, body)
+        }
     }
 }
 
@@ -713,6 +738,71 @@ mod tests {
             let token = client
                 .exchange_client_credentials()
                 .request(&move |_| Ok(http_response.clone()) as Result<_, FakeError>)
+                .unwrap();
+
+            assert_eq!("12/34", token.access_token().secret());
+        }
+
+        #[test]
+        fn res_map_reshapes_nonstandard_error_body_using_status() {
+            use crate::basic::BasicErrorResponseType;
+            use crate::ErrorResponse;
+
+            let client = new_client().set_nonstd_compat(
+                NonStdCompat::new()
+                    .with_res_map(
+                        "if $status == 200 then {access_token: .jwt, token_type: \"bearer\"} \
+                         else {error: \"invalid_client\", error_description: .msg} end",
+                    )
+                    .build()
+                    .unwrap(),
+            );
+
+            // Non-standard error body: no top-level `error` field, so today
+            // (without `res_map` mapping error responses too) this would
+            // fail to deserialize into `BasicErrorResponse` and surface as
+            // `RequestTokenError::Parse`.
+            let error_response = Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/json").unwrap(),
+                )
+                .body(
+                    "{\"msg\": \"bad creds\"}"
+                        .to_string()
+                        .into_bytes(),
+                )
+                .unwrap();
+
+            let err = client
+                .exchange_client_credentials()
+                .request(&move |_| Ok(error_response.clone()) as Result<_, FakeError>)
+                .unwrap_err();
+
+            match err {
+                RequestTokenError::ServerResponse(e) => {
+                    assert_eq!(e.error(), &BasicErrorResponseType::InvalidClient);
+                    assert_eq!(e.error_description(), Some(&"bad creds".to_string()));
+                }
+                other => panic!("expected ServerResponse, got {other:?}"),
+            }
+
+            // The success arm of the same filter/client still works,
+            // confirming one filter branches correctly both ways via
+            // `$status`.
+            let success_response = Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    HeaderValue::from_str("application/json").unwrap(),
+                )
+                .body("{\"jwt\": \"12/34\"}".to_string().into_bytes())
+                .unwrap();
+
+            let token = client
+                .exchange_client_credentials()
+                .request(&move |_| Ok(success_response.clone()) as Result<_, FakeError>)
                 .unwrap();
 
             assert_eq!("12/34", token.access_token().secret());
