@@ -323,15 +323,14 @@ impl CompiledFilter {
     pub(crate) fn run(
         &self,
         input: serde_json::Value,
-        vars: &[serde_json::Value],
+        vars: Vec<serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
         use jaq_core::{data, unwrap_valr, Ctx, Vars};
         use jaq_json::Val;
 
         let input: Val = serde_json::from_value(input).map_err(|err| err.to_string())?;
         let vars: Vec<Val> = vars
-            .iter()
-            .cloned()
+            .into_iter()
             .map(serde_json::from_value)
             .collect::<Result<_, _>>()
             .map_err(|err| err.to_string())?;
@@ -359,7 +358,8 @@ mod tests {
     }
 
     fn run(filter_src: &str, input: serde_json::Value) -> Result<serde_json::Value, String> {
-        CompiledFilter::new(filter_src, &default_denylist(), &["$status"])?.run(input, &[serde_json::json!(200)])
+        CompiledFilter::new(filter_src, &default_denylist(), &["$status"])?
+            .run(input, vec![serde_json::json!(200)])
     }
 
     #[test]
@@ -508,7 +508,7 @@ mod tests {
         let output = compat
             .req_map
             .expect("req_map should be compiled")
-            .run(serde_json::json!({}), &[])
+            .run(serde_json::json!({}), vec![])
             .unwrap();
         assert_eq!(output, serde_json::json!([1, 1, 1]));
     }
@@ -523,7 +523,7 @@ mod tests {
         let output = compat
             .req_map
             .expect("req_map should be compiled")
-            .run(serde_json::json!({"a": 1}), &[])
+            .run(serde_json::json!({"a": 1}), vec![])
             .unwrap();
         assert_eq!(output, serde_json::json!({"a": 1}));
     }
@@ -532,11 +532,11 @@ mod tests {
     fn compiled_filter_can_be_run_multiple_times() {
         let filter = CompiledFilter::new("{renamed: .value}", &default_denylist(), &[]).unwrap();
         assert_eq!(
-            filter.run(serde_json::json!({"value": 1}), &[]).unwrap(),
+            filter.run(serde_json::json!({"value": 1}), vec![]).unwrap(),
             serde_json::json!({"renamed": 1})
         );
         assert_eq!(
-            filter.run(serde_json::json!({"value": 2}), &[]).unwrap(),
+            filter.run(serde_json::json!({"value": 2}), vec![]).unwrap(),
             serde_json::json!({"renamed": 2})
         );
     }

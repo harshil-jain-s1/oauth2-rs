@@ -161,7 +161,7 @@ pub(crate) fn endpoint_request<'a>(
                     .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
                     .collect(),
             );
-            let mapped = filter.run(json_params, &[])?;
+            let mapped = filter.run(json_params, vec![])?;
             req_map_output_to_body(mapped)?
         }
         None => (
@@ -287,7 +287,9 @@ where
             serde_json::Value::String(BASE64_STANDARD.encode(response_body))
         };
         let status = serde_json::Value::from(http_response.status().as_u16());
-        let mapped = filter.run(value, &[status]).map_err(RequestTokenError::Other)?;
+        let mapped = filter
+            .run(value, vec![status])
+            .map_err(RequestTokenError::Other)?;
 
         return if http_response.status().is_success() {
             serde_path_to_error::deserialize(&mapped).map_err(|e| {
@@ -295,7 +297,8 @@ where
                 RequestTokenError::Parse(e, body)
             })
         } else {
-            Err(deserialize_error_response(&mapped))
+            let body = serde_json::to_vec(&mapped).unwrap_or_default();
+            Err(deserialize_error_response(&mapped, body))
         };
     }
 
@@ -360,34 +363,31 @@ where
                 "server returned empty error response".to_string(),
             ))
         } else {
-            let error = match serde_path_to_error::deserialize::<_, TE>(
+            Err(deserialize_error_response(
                 &mut serde_json::Deserializer::from_slice(reason),
-            ) {
-                Ok(error) => RequestTokenError::ServerResponse(error),
-                Err(error) => RequestTokenError::Parse(error, reason.to_vec()),
-            };
-            Err(error)
+                reason.to_vec(),
+            ))
         }
     } else {
         Ok(())
     }
 }
 
-/// Deserializes an already-mapped (`res_map`-transformed) JSON value into
-/// `TE`, mirroring what [`check_response_status`] does for the raw,
-/// unmapped error body.
-#[cfg(feature = "nonstd-compat")]
-fn deserialize_error_response<RE, TE>(value: &serde_json::Value) -> RequestTokenError<RE, TE>
+/// Deserializes a non-2xx response body (raw bytes, or an already-mapped
+/// `res_map`-transformed JSON value) into `TE`. `raw_body` is attached to
+/// the resulting error verbatim if deserialization fails.
+fn deserialize_error_response<'de, RE, TE, D>(
+    deserializer: D,
+    raw_body: Vec<u8>,
+) -> RequestTokenError<RE, TE>
 where
-    RE: Error,
+    RE: Error + 'static,
     TE: ErrorResponse,
+    D: serde::de::Deserializer<'de, Error = serde_json::Error>,
 {
-    match serde_path_to_error::deserialize::<_, TE>(value) {
+    match serde_path_to_error::deserialize::<_, TE>(deserializer) {
         Ok(error) => RequestTokenError::ServerResponse(error),
-        Err(error) => {
-            let body = serde_json::to_vec(value).unwrap_or_default();
-            RequestTokenError::Parse(error, body)
-        }
+        Err(error) => RequestTokenError::Parse(error, raw_body),
     }
 }
 
